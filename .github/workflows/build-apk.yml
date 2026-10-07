@@ -1,0 +1,48 @@
+name: APK bauen
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:   # manuell starten über den Tab "Actions"
+
+permissions:
+  contents: write      # nötig, um bei Tags ein Release anzulegen
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Gradle einrichten (mit Cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: gradlew ausführbar machen
+        run: chmod +x gradlew
+
+      - name: Tests ausführen
+        run: ./gradlew testDebugUnitTest
+
+      - name: Debug-APK bauen
+        run: ./gradlew assembleDebug
+
+      - name: APK als Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaddyLog-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Release anlegen (nur bei Tags wie v0.1)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/debug/*.apk
