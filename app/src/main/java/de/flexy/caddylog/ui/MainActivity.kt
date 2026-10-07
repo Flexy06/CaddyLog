@@ -164,6 +164,7 @@ fun App() {
     dialog?.let { CriticalWarning(it) }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DiagnoseScreen() {
     var sub by rememberSaveable { mutableIntStateOf(0) }
