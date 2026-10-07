@@ -12,8 +12,19 @@ android {
         applicationId = "de.flexy.caddylog"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
+    }
+
+    // Fixed debug key (committed on purpose): APKs from GitHub Actions and from Android Studio have the
+    // same signature, so updates install over the old version and recorded trips are kept.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {

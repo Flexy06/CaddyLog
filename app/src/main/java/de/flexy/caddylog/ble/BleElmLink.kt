@@ -44,7 +44,7 @@ class BleElmLink(
     private var ready = CompletableDeferred<Unit>()
     private val mutex = Mutex()
 
-    @Volatile var isConnected = false; private set
+    @Volatile override var isConnected = false
     var description = ""; private set
 
     companion object {

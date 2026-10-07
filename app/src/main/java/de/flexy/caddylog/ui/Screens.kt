@@ -3,6 +3,8 @@ package de.flexy.caddylog.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,7 +33,7 @@ import java.util.Locale
 // ---------------------------------------------------------------------------------------------- helpers
 
 @Composable
-private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
         Column(Modifier.padding(14.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium)
@@ -43,7 +45,7 @@ private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) 
 
 @Composable
 private fun NotConnectedHint() {
-    Section("Nicht verbunden") { Text("Verbinde dich zuerst im Tab „Verbindung“ mit dem iCar Pro.") }
+    Section("Nicht verbunden") { Text("Verbinde dich zuerst im Tab „Live“ mit dem iCar Pro.") }
 }
 
 @Composable
@@ -106,12 +108,16 @@ fun ConnectScreen() {
                     }
                     Text("Aktuelle Session: ${session ?: "—"}", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = LoggerEngine::disconnect) { Text("Trennen") }
-                        OutlinedButton(onClick = LoggerEngine::newSession) { Text("Neue Session") }
-                    }
+                    Button(onClick = LoggerEngine::disconnect) { Text("Trennen") }
                 }
                 is Conn.Connecting -> Section("Verbinde mit ${c.name} …") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                is Conn.Reconnecting -> Section("Verbindung verloren – verbinde neu …") {
+                    Text("${c.name}: Versuch ${c.attempt}. Die Fahrtaufzeichnung läuft weiter, bis die Verbindung wieder steht.")
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = LoggerEngine::disconnect) { Text("Abbrechen") }
+                }
                 else -> Section("iCar Pro verbinden") {
                     Text("Zündung einschalten (oder Motor starten), Adapter in die OBD-Buchse stecken, dann suchen. " +
                             "Der Adapter wird NICHT in den Android-Bluetooth-Einstellungen gekoppelt – nur hier in der App auswählen.")
@@ -126,7 +132,7 @@ fun ConnectScreen() {
                 }
             }
         }
-        if (conn !is Conn.Ready && conn !is Conn.Connecting) {
+        if (conn is Conn.Off || conn is Conn.Failed) {
             items(devices, key = { it.address }) { d ->
                 ListItem(
                     modifier = Modifier.clickable { LoggerEngine.connect(d) },
@@ -149,15 +155,25 @@ fun ScanScreen() {
     var allAddresses by rememberSaveable { mutableStateOf(false) }
     var allGroups by rememberSaveable { mutableStateOf(false) }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         if (conn !is Conn.Ready) { NotConnectedHint(); return@Column }
         Section("OBD2-Komplettscan") {
             Text("Alle unterstützten Standard-PIDs, Fehlerspeicher (gespeichert/temporär/permanent), Freeze Frame, " +
-                    "Fahrzeuginfo (VIN, Kalibrierung) und On-Board-Tests (Mode 06). Dauer ca. 1 min.")
+                    "Fahrzeuginfo (VIN, Kalibrierung) und On-Board-Tests (Mode 06). Dauer ca. 1–2 min. " +
+                    "Während eines Scans ist die Live-Überwachung pausiert – deshalb nur im Stand ausführen.")
             Spacer(Modifier.height(8.dp))
             Button(enabled = activity == null, onClick = LoggerEngine::runObdScan) { Text("OBD2-Scan starten") }
         }
-        Section("VW-Steuergeräte (TP2.0 / KWP2000)") {
+        val kLine = (conn as? Conn.Ready)?.bus == de.flexy.caddylog.core.Bus.KLINE
+        Section("Fehlerspeicher") {
+            Text("Liest gespeicherte, temporäre und permanente OBD2-Fehlercodes (nur lesen, es wird nichts gelöscht).")
+            Spacer(Modifier.height(8.dp))
+            Button(enabled = activity == null, onClick = LoggerEngine::readDtcs) { Text("Fehlerspeicher lesen") }
+        }
+        if (kLine) Section("VW-Steuergeräte (TP2.0)") {
+            Text("Nicht verfügbar: Dein Caddy kommuniziert über K-Line (ISO 14230-4). Der VW-TP2.0-Scan funktioniert nur über CAN " +
+                    "und wird deshalb nicht ausgeführt.", style = MaterialTheme.typography.bodyMedium)
+        } else Section("VW-Steuergeräte (TP2.0 / KWP2000)") {
             Text("Sucht alle Steuergeräte und liest Identifikation, Fehlerspeicher und Messwertblöcke. " +
                     "Nur lesend. Am besten im Stand mit laufendem Motor.")
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -174,53 +190,22 @@ fun ScanScreen() {
             }) { Text("VW-Scan starten") }
         }
         RunningBar()
-        ProgressLog(Modifier.weight(1f).fillMaxWidth())
+        ProgressLog(Modifier.height(360.dp).fillMaxWidth())
     }
 }
 
-// ---------------------------------------------------------------------------------------------- Live
+// ---------------------------------------------------------------------------------------------- Alle Werte
 
+/** All channels read so far (live monitor + scans), with raw bytes. */
 @Composable
-fun LiveScreen() {
-    val conn by LoggerEngine.conn.collectAsStateWithLifecycle()
-    val activity by LoggerEngine.activity.collectAsStateWithLifecycle()
-    val stats by LoggerEngine.live.collectAsStateWithLifecycle()
+fun AllValuesScreen() {
     val latest by LoggerEngine.latest.collectAsStateWithLifecycle()
-    var allObd by rememberSaveable { mutableStateOf(true) }
-    var vwSpec by rememberSaveable { mutableStateOf("01:1-10") }
-    var pause by rememberSaveable { mutableStateOf("0") }
     var filter by rememberSaveable { mutableStateOf("") }
 
     LazyColumn(Modifier.fillMaxSize()) {
         item {
-            if (conn !is Conn.Ready) NotConnectedHint()
-            else Section("Live-Logging") {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(allObd, { allObd = it }, enabled = !stats.running)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (allObd) "Alle unterstützten OBD-PIDs" else "Nur Basis-PIDs (Last, Temp., Drehzahl, Speed, MAF …)")
-                }
-                OutlinedTextField(vwSpec, { vwSpec = it }, Modifier.fillMaxWidth(), enabled = !stats.running,
-                    label = { Text("VW-Messwertblöcke (SG:Gruppen)") },
-                    supportingText = { Text("z. B. 01:1-10, 01:115, 17:1 · leer = keine. SG hex, Gruppen dezimal.") })
-                OutlinedTextField(pause, { pause = it.filter(Char::isDigit) }, Modifier.fillMaxWidth(), enabled = !stats.running,
-                    label = { Text("Pause zwischen Zyklen (ms)") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (stats.running) Button(onClick = LoggerEngine::cancelTask) { Text("Stopp") }
-                    else Button(enabled = activity == null, onClick = {
-                        LoggerEngine.startLive(allObd, vwSpec, pause.toLongOrNull() ?: 0)
-                    }) { Text("Start") }
-                    Spacer(Modifier.width(12.dp))
-                    Text("${stats.cycles} Zyklen · ${stats.lastCycleMs} ms/Zyklus · ${stats.readings} Werte",
-                        style = MaterialTheme.typography.bodySmall)
-                }
-                Text("Logging läuft mit ausgeschaltetem Bildschirm weiter. Bitte nicht während der Fahrt bedienen.",
-                    style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        item {
+            Text("Alle bisher gelesenen Kanäle (Live-Überwachung und Scans) mit Rohbytes. Zeitstempel = letzter Empfang.",
+                Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(filter, { filter = it }, Modifier.fillMaxWidth().padding(horizontal = 12.dp),
                 label = { Text("Filter (${latest.size} Kanäle)") }, singleLine = true)
         }
@@ -231,7 +216,7 @@ fun LiveScreen() {
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp)) {
                 Column(Modifier.weight(1f)) {
                     Text(r.name, style = MaterialTheme.typography.bodyMedium)
-                    Text("${r.channel} · roh ${r.raw}", style = MaterialTheme.typography.labelSmall,
+                    Text("${r.channel} · roh ${r.raw} · ${timeOf(r.timeMs)}", style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                 }
                 Spacer(Modifier.width(8.dp))
@@ -242,59 +227,8 @@ fun LiveScreen() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------- Daten
-
-@Composable
-fun DataScreen() {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val sessions by LoggerEngine.sessions.collectAsStateWithLifecycle()
-    val current by LoggerEngine.currentSession.collectAsStateWithLifecycle()
-    var toSave by remember { mutableStateOf<File?>(null) }
-    var toDelete by remember { mutableStateOf<File?>(null) }
-    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        val dir = toSave
-        if (uri != null && dir != null) scope.launch { LoggerEngine.saveZipTo(dir, uri) }
-        toSave = null
-    }
-    LaunchedEffect(Unit) { LoggerEngine.refreshSessions() }
-
-    LazyColumn(Modifier.fillMaxSize()) {
-        item {
-            Section("Sessions") {
-                Text("Jede Verbindung erzeugt eine Session mit live.csv (alle Messwerte), scan_*.json (Scan-Ergebnisse), " +
-                        "raw.log (jede Anfrage/Antwort) und meta.json. „Teilen“ erzeugt eine ZIP-Datei – die kannst du mir direkt schicken.")
-            }
-        }
-        if (sessions.isEmpty()) item { Text("Noch keine Sessions.", Modifier.padding(16.dp)) }
-        items(sessions, key = { it.dir.name }) { s ->
-            ListItem(
-                headlineContent = { Text(s.dir.name + if (s.dir.name == current) "  (aktiv)" else "") },
-                supportingContent = { Text("${s.files} Dateien · ${formatSize(s.sizeBytes)}") },
-                trailingContent = {
-                    Row {
-                        TextButton(onClick = {
-                            scope.launch { ctx.startActivity(shareIntent(LoggerEngine.exportZip(s.dir))) }
-                        }) { Text("Teilen") }
-                        TextButton(onClick = { toSave = s.dir; saveLauncher.launch("CaddyLog_${s.dir.name}.zip") }) { Text("Speichern") }
-                        if (s.dir.name != current) TextButton(onClick = { toDelete = s.dir }) { Text("Löschen") }
-                    }
-                }
-            )
-            HorizontalDivider()
-        }
-    }
-
-    toDelete?.let { d ->
-        AlertDialog(
-            onDismissRequest = { toDelete = null },
-            title = { Text("Session löschen?") },
-            text = { Text(d.name) },
-            confirmButton = { TextButton(onClick = { LoggerEngine.deleteSession(d); toDelete = null }) { Text("Löschen") } },
-            dismissButton = { TextButton(onClick = { toDelete = null }) { Text("Abbrechen") } }
-        )
-    }
-}
+fun timeOf(ms: Long): String = java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault())
+    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"))
 
 // ---------------------------------------------------------------------------------------------- Konsole
 
@@ -309,7 +243,8 @@ fun ConsoleScreen() {
 
     Column(Modifier.fillMaxSize()) {
         if (conn !is Conn.Ready) NotConnectedHint()
-        Text("Alle Befehle/Antworten des Adapters (> gesendet, < empfangen). Eigene Befehle landen auch im raw.log.",
+        Text("Alle Befehle/Antworten des Adapters (> gesendet, < empfangen). Eigene Befehle landen auch im raw.log. " +
+                "Erlaubt sind nur lesende Befehle (AT…, OBD-Services 01, 02, 03, 06, 07, 09, 0A) – Löschen/Schreiben/Steuern ist gesperrt.",
             Modifier.padding(horizontal = 16.dp, vertical = 6.dp), style = MaterialTheme.typography.bodySmall)
         LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), state = state) {
             items(lines) { Text(it, fontFamily = FontFamily.Monospace, fontSize = 11.sp) }

@@ -17,11 +17,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import de.flexy.caddylog.core.CoolantMonitor
+import de.flexy.caddylog.monitor.MonitorEngine
 import kotlinx.coroutines.launch
 
 /**
  * Keeps the process (and the BLE connection) alive while connected, so logging continues with the screen off.
- * The actual work happens in [LoggerEngine]; this service only holds the foreground state + a wake lock.
+ * The work happens in [LoggerEngine] / [MonitorEngine]; this service holds the foreground state + a wake lock
+ * and shows the current coolant temperature in its notification.
  */
 class LoggingService : Service() {
 
@@ -33,18 +37,24 @@ class LoggingService : Service() {
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Logging", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Überwachung läuft", NotificationManager.IMPORTANCE_LOW))
         startForeground(ID, build("Verbunden"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         wakeLock = getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CaddyLog:logging").apply { acquire(6 * 60 * 60 * 1000L) }
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CaddyLog:logging").apply { acquire(12 * 60 * 60 * 1000L) }
         scope.launch {
-            combine(LoggerEngine.activity, LoggerEngine.live) { a, l ->
-                when {
-                    l.running -> "Live-Logging: ${l.cycles} Zyklen, ${l.readings} Werte"
-                    a != null -> a
-                    else -> "Verbunden – bereit"
+            combine(LoggerEngine.activity, LoggerEngine.conn, MonitorEngine.ui) { a, c, m ->
+                val cool = m.coolant
+                val temp = when {
+                    cool.tempC == null -> "Kühlmittel: –"
+                    cool.fresh -> "Kühlmittel ${CoolantMonitor.fmt(cool.tempC)} °C · ${cool.level.label}"
+                    else -> "Kühlmittel: keine aktuelle Messung (zuletzt ${CoolantMonitor.fmt(cool.tempC)} °C)"
                 }
-            }.collect { nm.notify(ID, build(it)) }
+                when {
+                    c is LoggerEngine.Conn.Reconnecting -> "Verbindung verloren – verbinde neu (Versuch ${c.attempt}) · $temp"
+                    a != null -> "$a · Überwachung pausiert"
+                    else -> temp + (if (m.trip != null) " · Fahrt wird aufgezeichnet" else "") + " · " + hz(m.effectiveHz)
+                }
+            }.distinctUntilChanged().collect { nm.notify(ID, build(it)) }
         }
     }
 
@@ -54,13 +64,15 @@ class LoggingService : Service() {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("CaddyLog")
+            .setContentTitle("CaddyLog – Live-Überwachung")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(pi)
             .build()
     }
+
+    private fun hz(v: Double) = if (v >= 1) "${v.toInt()} Hz" else "$v Hz"
 
     override fun onDestroy() {
         scope.cancel()

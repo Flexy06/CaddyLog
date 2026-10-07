@@ -3,12 +3,77 @@ package de.flexy.caddylog.core
 /** Standard OBD2 (SAE J1979) client over the ELM327. All requests are functional (7DF), every ECU answering is recorded. */
 class Obd(private val elm: Elm327) {
 
-    /** Sends a request and returns the reassembled payload per responding ECU (CAN id). */
-    suspend fun request(vararg bytes: Int, timeoutMs: Long = 3000): List<Pair<Int, IntArray>> {
-        elm.ensureObd()
-        val r = elm.cmd(bytes.toHex(""), timeoutMs)
-        if (Elm327.isError(r) && Elm327.parseFrames(r).isEmpty()) return emptyList()
-        return IsoTp.reassemble(Elm327.parseFrames(r))
+    /** Result of one request including the error classification (needed for live monitoring). */
+    data class Response(val status: ReadStatus, val payloads: List<Pair<Int, IntArray>>, val raw: String, val busInit: Boolean = false)
+
+    /**
+     * Sends a request and returns the payload per responding ECU
+     * (CAN: reassembled ISO-TP message keyed by CAN id; K-Line: KWP/ISO9141 frames keyed by source address).
+     */
+    suspend fun requestDetailed(vararg bytes: Int, timeoutMs: Long = 3000, expectOne: Boolean = false): Response {
+        val useCount = expectOne && elm.bus == Bus.KLINE && elm.responseCountSupported != false
+        val r = try {
+            elm.ensureObd()
+            val first = elm.cmd(bytes.toHex("") + if (useCount) "1" else "", timeoutMs)
+            if (useCount && first.lines().any { it.trim() == "?" }) {
+                elm.responseCountSupported = false   // old/clone adapter: fall back to normal requests
+                elm.cmd(bytes.toHex(""), timeoutMs)
+            } else {
+                if (useCount && !Elm327.isError(first)) elm.responseCountSupported = true
+                first
+            }
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return Response(if (elm.linkConnected) ReadStatus.TIMEOUT else ReadStatus.LINK_LOST, emptyList(), e.message ?: "")
+        }
+        val busInit = r.lines().any { it.trim().startsWith("BUS INIT") && !it.contains("ERROR") }
+        val upper = r.uppercase()
+        val payloads: List<Pair<Int, IntArray>>
+        var checksumErrors = 0
+        if (elm.bus == Bus.KLINE) {
+            val parsed = KLine.parse(r)
+            checksumErrors = parsed.checksumErrors
+            payloads = KLine.toPayloads(parsed.frames.filter { it.checksumOk != false })
+        } else {
+            val can = IsoTp.reassemble(Elm327.parseFrames(r))
+            payloads = if (can.isEmpty() && elm.bus == Bus.UNKNOWN) {
+                val parsed = KLine.parse(r)  // bus not known yet: K-Line answer?
+                checksumErrors = parsed.checksumErrors
+                KLine.toPayloads(parsed.frames.filter { it.checksumOk != false })
+            } else can
+        }
+        val status = when {
+            payloads.isNotEmpty() -> ReadStatus.OK
+            checksumErrors > 0 || upper.contains("DATA ERROR") -> ReadStatus.CHECKSUM_ERROR
+            upper.contains("BUS INIT") || upper.contains("UNABLE TO CONNECT") || upper.contains("BUS ERROR") || upper.contains("CAN ERROR") -> ReadStatus.BUS_INIT
+            upper.contains("NO DATA") -> ReadStatus.NO_DATA
+            upper.contains("STOPPED") -> ReadStatus.TIMEOUT
+            r.isBlank() -> ReadStatus.NO_DATA
+            else -> ReadStatus.INVALID
+        }
+        return Response(status, payloads, r, busInit)
+    }
+
+    suspend fun request(vararg bytes: Int, timeoutMs: Long = 3000): List<Pair<Int, IntArray>> =
+        requestDetailed(*bytes, timeoutMs = timeoutMs).payloads
+
+    /**
+     * Reads ONE mode 01 PID and classifies the outcome. Used by the live monitor:
+     * every reading carries the time it was actually received from the vehicle.
+     */
+    suspend fun readPid(pid: Int, timeoutMs: Long = 2000): PidResult {
+        val resp = requestDetailed(0x01, pid, timeoutMs = timeoutMs, expectOne = true)
+        if (resp.status != ReadStatus.OK) return PidResult(pid, resp.status, raw = resp.raw, busInit = resp.busInit)
+        val matching = resp.payloads.filter { (_, p) -> p.size >= 2 && p[0] == 0x41 && p[1] == pid }
+        if (matching.isEmpty()) {
+            val negative = resp.payloads.any { (_, p) -> p.isNotEmpty() && p[0] == 0x7F }
+            return PidResult(pid, if (negative) ReadStatus.NOT_SUPPORTED else ReadStatus.INVALID, raw = resp.raw, busInit = resp.busInit)
+        }
+        val readings = matching.flatMap { (ecu, p) -> decodeMode01(ecu, p) }
+        val def = ObdPids.defs[pid]
+        if (def != null && matching.all { (_, p) -> p.size < 2 + def.len }) return PidResult(pid, ReadStatus.INVALID, raw = resp.raw, busInit = resp.busInit)
+        return PidResult(pid, ReadStatus.OK, readings, resp.raw, resp.busInit)
     }
 
     /** Supported PIDs per ECU for modes 01, 02 (freeze frame), 06, 09. */
@@ -70,7 +135,9 @@ class Obd(private val elm: Elm327) {
         val out = mutableListOf<Reading>()
         val known = pids.filter { ObdPids.defs.containsKey(it) && !ObdPids.isBitmapPid(it) }
         val unknown = pids.filter { !ObdPids.defs.containsKey(it) && !ObdPids.isBitmapPid(it) }
-        for (batch in known.chunked(6)) {
+        // multiple PIDs per request are only allowed on CAN (ISO 15765-4); K-Line: one PID per request
+        val batchSize = if (elm.bus == Bus.CAN) 6 else 1
+        for (batch in known.chunked(batchSize)) {
             val resp = request(0x01, *batch.toIntArray())
             for ((ecu, p) in resp) if (p.isNotEmpty() && p[0] == 0x41) out += decodeMode01(ecu, p)
         }
@@ -150,7 +217,7 @@ class Obd(private val elm: Elm327) {
         for ((ecu, mids) in sup06) for (mid in mids.filter { !ObdPids.isBitmapPid(it) }) {
             for ((e, p) in request(0x06, mid)) {
                 if (e != ecu || p.size < 2 || p[0] != 0x46) continue
-                val tests = p.copyOfRange(1, p.size).toList().chunked(9).filter { it.size == 9 }.map { t ->
+                val tests = if (elm.bus != Bus.CAN) emptyList() else p.copyOfRange(1, p.size).toList().chunked(9).filter { it.size == 9 }.map { t ->
                     val v = t[3] * 256 + t[4]; val mn = t[5] * 256 + t[6]; val mx = t[7] * 256 + t[8]
                     mapOf("mid" to "%02X".format(t[0]), "tid" to "%02X".format(t[1]), "uasid" to "%02X".format(t[2]),
                         "value" to v, "min" to mn, "max" to mx, "pass" to (v in mn..mx))
