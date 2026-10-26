@@ -12,8 +12,8 @@ android {
         applicationId = "de.flexy.caddylog"
         minSdk = 31
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     // Fixed debug key (committed on purpose): APKs from GitHub Actions and from Android Studio have the

@@ -29,7 +29,14 @@ data class AppSettings(
     val preferredProtocol: String? = null,
     val allTimeMax: Double? = null,
     val allTimeMaxMs: Long? = null,
+    /** written into meta.json of every session, so the logs of different cars can be told apart */
+    val vehicleName: String = VEHICLE_CADDY,
 ) {
+    companion object {
+        const val VEHICLE_CADDY = "VW Caddy Maxi 2.0 EcoFuel (CNG), 2010"
+        const val VEHICLE_T5 = "VW T5, ca. 2006"
+    }
+
     fun thresholds() = CoolantThresholds(
         elevated = elevated, warning = warning, strong = strong, critical = critical, extreme = extreme,
         hysteresis = hysteresis, riseRatePerMin = riseRatePerMin, riseDelta = riseDelta,
@@ -63,7 +70,11 @@ object Settings {
             preferredProtocol = prefs.getString("protocol", null),
             allTimeMax = prefs.getString("allTimeMax", null)?.toDoubleOrNull(),
             allTimeMaxMs = prefs.getLong("allTimeMaxMs", 0).takeIf { it > 0 },
-        ).let { if (it.isValid()) it else d.copy(preferredProtocol = it.preferredProtocol, allTimeMax = it.allTimeMax, allTimeMaxMs = it.allTimeMaxMs) }
+            vehicleName = prefs.getString("vehicleName", null)?.takeIf { it.isNotBlank() } ?: d.vehicleName,
+        ).let {
+            if (it.isValid()) it
+            else d.copy(preferredProtocol = it.preferredProtocol, allTimeMax = it.allTimeMax, allTimeMaxMs = it.allTimeMaxMs, vehicleName = it.vehicleName)
+        }
     }
 
     @Synchronized
@@ -83,6 +94,7 @@ object Settings {
             if (n.preferredProtocol != null) putString("protocol", n.preferredProtocol) else remove("protocol")
             if (n.allTimeMax != null) putString("allTimeMax", n.allTimeMax.toString()) else remove("allTimeMax")
             putLong("allTimeMaxMs", n.allTimeMaxMs ?: 0)
+            putString("vehicleName", n.vehicleName)
         }.apply()
         return true
     }

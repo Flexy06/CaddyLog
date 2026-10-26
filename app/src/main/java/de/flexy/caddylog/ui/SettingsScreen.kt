@@ -31,6 +31,17 @@ fun SettingsScreen() {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
         Text("Einstellungen", Modifier.padding(16.dp), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
 
+        Section("Fahrzeug") {
+            Text("Steht in meta.json jeder Aufzeichnung. Die App liest unabhängig davon alle Sensoren, die das Steuergerät " +
+                    "meldet – ein anderes Auto wird automatisch erkannt (K-Line oder CAN).", style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for ((label, name) in listOf("Caddy" to AppSettings.VEHICLE_CADDY, "T5" to AppSettings.VEHICLE_T5)) {
+                    FilterChip(selected = f.vehicle == name, onClick = { f = f.copy(vehicle = name) }, label = { Text(label) })
+                }
+            }
+            OutlinedTextField(f.vehicle, { f = f.copy(vehicle = it) }, Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                label = { Text("Bezeichnung") }, singleLine = true)
+        }
         Section("Warnschwellen Kühlmittel (°C)") {
             Text("Diagnostische Warnschwellen – ein Überschreiten bedeutet nicht automatisch einen Motorschaden.",
                 style = MaterialTheme.typography.bodySmall)
@@ -91,7 +102,7 @@ fun SettingsScreen() {
                     MonitorEngine.applySettings()
                 }
             }) { Text("Speichern") }
-            OutlinedButton(onClick = { f = SettingsForm.from(AppSettings().copy(preferredProtocol = saved.preferredProtocol)); message = null }) { Text("Standardwerte") }
+            OutlinedButton(onClick = { f = SettingsForm.from(AppSettings().copy(preferredProtocol = saved.preferredProtocol, vehicleName = saved.vehicleName)); message = null }) { Text("Standardwerte") }
         }
     }
 }
@@ -100,7 +111,7 @@ private data class SettingsForm(
     val elevated: String, val warning: String, val strong: String, val critical: String, val extreme: String,
     val hysteresis: String, val riseRate: String, val riseDelta: String, val sustainedMin: String,
     val sampleHz: Double, val sound: Boolean, val vibrate: Boolean, val repeatSec: String, val ackRepeatSec: String,
-    val autoTrip: Boolean, val autoReconnect: Boolean,
+    val autoTrip: Boolean, val autoReconnect: Boolean, val vehicle: String,
 ) {
     fun toSettings(base: AppSettings): AppSettings? {
         fun d(s: String) = s.replace(',', '.').trim().toDoubleOrNull()
@@ -111,6 +122,7 @@ private data class SettingsForm(
             sustainedMin = d(sustainedMin) ?: return null, sampleHz = sampleHz, soundEnabled = sound, vibrate = vibrate,
             repeatSec = d(repeatSec)?.toInt() ?: return null, ackRepeatSec = d(ackRepeatSec)?.toInt() ?: return null,
             autoTrip = autoTrip, autoReconnect = autoReconnect,
+            vehicleName = vehicle.trim().ifEmpty { AppSettings.VEHICLE_CADDY },
         )
     }
 
@@ -119,7 +131,7 @@ private data class SettingsForm(
         fun from(s: AppSettings) = SettingsForm(
             n(s.elevated), n(s.warning), n(s.strong), n(s.critical), n(s.extreme), n(s.hysteresis),
             n(s.riseRatePerMin), n(s.riseDelta), n(s.sustainedMin), s.sampleHz, s.soundEnabled, s.vibrate,
-            s.repeatSec.toString(), s.ackRepeatSec.toString(), s.autoTrip, s.autoReconnect,
+            s.repeatSec.toString(), s.ackRepeatSec.toString(), s.autoTrip, s.autoReconnect, s.vehicleName,
         )
     }
 }

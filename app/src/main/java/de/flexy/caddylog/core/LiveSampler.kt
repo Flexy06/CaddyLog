@@ -48,6 +48,8 @@ class LiveSampler(
 
     companion object {
         val DEFAULT_PRIORITY = listOf(0x0C, 0x0D, 0x04, 0x0F, 0x0B, 0x11)
+        /** polled with priority only if the ECU reports them as supported (oil temp., exhaust gas / DPF temp.) */
+        val OPTIONAL_PRIORITY = listOf(0x5C, 0x78, 0x7C)
         val RATE_STEPS = listOf(5.0, 2.0, 1.0, 0.5)
 
         fun nextLower(hz: Double): Double? = RATE_STEPS.firstOrNull { it < hz - 1e-9 }

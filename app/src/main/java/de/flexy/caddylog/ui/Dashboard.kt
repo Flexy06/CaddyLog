@@ -274,7 +274,7 @@ fun TripSummaryCard(lines: List<String>, onDetails: () -> Unit, onClose: () -> U
 @Composable
 private fun SignalsCard(st: MonitorEngine.UiState, now: Long, maxAge: Long) {
     DashCard("Motorwerte") {
-        val list = listOf(Signal.RPM, Signal.SPEED, Signal.LOAD, Signal.IAT, Signal.MAP, Signal.THROTTLE, Signal.ECU_VOLTAGE, Signal.BATTERY)
+        val list = listOf(Signal.RPM, Signal.SPEED, Signal.LOAD, Signal.IAT, Signal.MAP, Signal.THROTTLE, Signal.OIL_TEMP, Signal.EXHAUST_TEMP, Signal.ECU_VOLTAGE, Signal.BATTERY)
         for (sig in list) {
             val s = st.signals[sig]
             val fresh = s?.isFresh(now, maxAge) == true

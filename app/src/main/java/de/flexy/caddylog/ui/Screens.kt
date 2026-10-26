@@ -170,14 +170,17 @@ fun ScanScreen() {
             Spacer(Modifier.height(8.dp))
             Button(enabled = activity == null, onClick = LoggerEngine::readDtcs) { Text("Fehlerspeicher lesen") }
         }
-        if (kLine) Section("VW-Steuergeräte (TP2.0)") {
-            Text("Nicht verfügbar: Dein Caddy kommuniziert über K-Line (ISO 14230-4). Der VW-TP2.0-Scan funktioniert nur über CAN " +
-                    "und wird deshalb nicht ausgeführt.", style = MaterialTheme.typography.bodyMedium)
-        } else Section("VW-Steuergeräte (TP2.0 / KWP2000)") {
-            Text("Sucht alle Steuergeräte und liest Identifikation, Fehlerspeicher und Messwertblöcke. " +
+        Section(if (kLine) "VW-Messwertblöcke (K-Line, KWP2000)" else "VW-Steuergeräte (TP2.0 / KWP2000)") {
+            Text(if (kLine)
+                "Das Fahrzeug kommuniziert über K-Line. Die App baut eine KWP2000-Sitzung direkt zum Motorsteuergerät (Adresse 01) " +
+                    "auf und liest Identifikation, Fehlerspeicher und Messwertblöcke – dort stecken herstellerspezifische Werte " +
+                    "wie Abgas- oder Öltemperatur, falls das Auto sie hat. Nur lesend. Steuergeräte, die nur das alte KW1281 " +
+                    "sprechen, lassen sich mit einem ELM327 nicht auslesen."
+            else "Sucht alle Steuergeräte und liest Identifikation, Fehlerspeicher und Messwertblöcke. " +
                     "Nur lesend. Am besten im Stand mit laufendem Motor.")
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(allAddresses, { allAddresses = it }); Text("Alle Adressen 01–7F (sonst ~45 bekannte)")
+                Checkbox(allAddresses, { allAddresses = it })
+                Text(if (kLine) "Weitere Steuergeräte (Getriebe, ABS, Klima, Airbag, Kombi, Wegfahrsperre)" else "Alle Adressen 01–7F (sonst ~45 bekannte)")
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(allGroups, { allGroups = it }); Text("Messwertblöcke 1–255 (sonst 1–50)")
@@ -187,7 +190,7 @@ fun ScanScreen() {
             Spacer(Modifier.height(8.dp))
             Button(enabled = activity == null, onClick = {
                 LoggerEngine.runVwScan(allAddresses, if (allGroups) 1..255 else 1..50)
-            }) { Text("VW-Scan starten") }
+            }) { Text(if (kLine) "Messwertblöcke lesen" else "VW-Scan starten") }
         }
         RunningBar()
         ProgressLog(Modifier.height(360.dp).fillMaxWidth())

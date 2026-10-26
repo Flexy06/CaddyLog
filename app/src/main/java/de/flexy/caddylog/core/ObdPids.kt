@@ -23,6 +23,31 @@ object ObdPids {
     private fun ab(d: IntArray) = d[0] * 256 + d[1]
     private fun cd(d: IntArray) = d[2] * 256 + d[3]
     private fun s16(v: Int) = if (v >= 32768) v - 65536 else v
+    private fun ab2(d: IntArray, o: Int) = d[o] * 256 + d[o + 1]
+
+    /** multi-sensor PIDs: bit i of byte A says whether sensor i exists (null → leave the value out) */
+    private fun bit(d: IntArray, i: Int): Unit? = if ((d[0] shr i) and 1 == 1) Unit else null
+
+    /** byte A = sensor bitmask, then [n] 2-byte values */
+    private fun sensors(d: IntArray, n: Int, name: String, unit: String, f: (Int) -> Double) =
+        (0 until n).mapNotNull { i -> bit(d, i)?.let { PidValue(".s${i + 1}", "$name${i + 1}", f(ab2(d, 1 + 2 * i)), unit) } }
+
+    /** byte A = sensor bitmask, then [n] 1-byte values */
+    private fun sensors1(d: IntArray, n: Int, name: String, unit: String, f: (Int) -> Double) =
+        (0 until n).mapNotNull { i -> bit(d, i)?.let { PidValue(".s${i + 1}", "$name ${i + 1}", f(d[1 + i]), unit) } }
+
+    private fun turboTemps(d: IntArray) = listOfNotNull(
+        bit(d, 0)?.let { PidValue(".v_ein", "Verdichter Eingang", d[1] - 40.0, "°C") },
+        bit(d, 1)?.let { PidValue(".v_aus", "Verdichter Ausgang", d[2] - 40.0, "°C") },
+        bit(d, 2)?.let { PidValue(".t_ein", "Turbine Eingang", ab2(d, 3) / 10.0 - 40, "°C") },
+        bit(d, 3)?.let { PidValue(".t_aus", "Turbine Ausgang", ab2(d, 5) / 10.0 - 40, "°C") },
+    )
+
+    private fun dpfPressure(d: IntArray) = listOfNotNull(
+        bit(d, 0)?.let { PidValue(".delta", "Differenzdruck", ab2(d, 1) * 0.01, "kPa") },
+        bit(d, 1)?.let { PidValue(".ein", "Eingangsdruck", ab2(d, 3) * 0.01, "kPa") },
+        bit(d, 2)?.let { PidValue(".aus", "Ausgangsdruck", ab2(d, 5) * 0.01, "kPa") },
+    )
 
     private val FUEL_SYSTEM = mapOf(
         0 to "aus", 1 to "Open loop (zu kalt)", 2 to "Closed loop (Lambda)", 4 to "Open loop (Last/Schub)",
@@ -148,10 +173,59 @@ object ObdPids {
         add(0x61, 1, "Fahrerwunsch-Moment", one("Wunschmoment", "%") { it[0] - 125.0 })
         add(0x62, 1, "Ist-Moment", one("Ist-Moment", "%") { it[0] - 125.0 })
         add(0x63, 2, "Referenzmoment", one("Referenzmoment", "Nm") { ab(it).toDouble() })
+
+        // ---- PIDs 0x64+ (multi-sensor PIDs: byte A = bitmask which sensors exist, then the values) ----
+        add(0x64, 5, "Motormoment-Kennpunkte") { d ->
+            (0..4).map { i -> PidValue(".$i", "Punkt ${i + 1}", d[i] - 125.0, "%") }
+        }
+        add(0x66, 5, "Luftmassenmesser (Sensoren)") { d -> sensors(d, 2, "MAF ", "g/s") { it / 32.0 } }
+        add(0x67, 3, "Kühlmitteltemperatur (Sensoren)") { d -> sensors1(d, 2, "Kühlmittel", "°C") { it - 40.0 } }
+        add(0x68, 7, "Ansauglufttemperatur (Sensoren)") { d -> sensors1(d, 6, "Ansaugluft", "°C") { it - 40.0 } }
+        add(0x6B, 5, "AGR-Temperatur") { d -> sensors1(d, 4, "AGR-Temp", "°C") { it - 40.0 } }
+        add(0x6F, 3, "Verdichter-Eingangsdruck") { d -> sensors1(d, 2, "Turbo-Eingang", "kPa") { it.toDouble() } }
+        add(0x70, 10, "Ladedruckregelung") { d ->
+            listOfNotNull(
+                bit(d, 0)?.let { PidValue(".soll_a", "Ladedruck soll A", ab2(d, 1) * 0.03125, "kPa") },
+                bit(d, 1)?.let { PidValue(".ist_a", "Ladedruck ist A", ab2(d, 3) * 0.03125, "kPa") },
+                bit(d, 2)?.let { PidValue(".soll_b", "Ladedruck soll B", ab2(d, 5) * 0.03125, "kPa") },
+                bit(d, 3)?.let { PidValue(".ist_b", "Ladedruck ist B", ab2(d, 7) * 0.03125, "kPa") },
+            )
+        }
+        add(0x73, 5, "Abgasdruck") { d -> sensors(d, 2, "Abgasdruck Bank ", "kPa") { it * 0.01 } }
+        add(0x74, 5, "Turboladerdrehzahl") { d -> sensors(d, 2, "Turbo ", "1/min") { it * 10.0 } }
+        add(0x75, 7, "Turbolader-Temperatur A") { d -> turboTemps(d) }
+        add(0x76, 7, "Turbolader-Temperatur B") { d -> turboTemps(d) }
+        add(0x77, 5, "Ladeluftkühler-Temperatur") { d -> sensors1(d, 4, "LLK-Temp", "°C") { it - 40.0 } }
+        add(0x78, 9, "Abgastemperatur Bank 1") { d -> sensors(d, 4, "Abgas B1 S", "°C") { it / 10.0 - 40 } }
+        add(0x79, 9, "Abgastemperatur Bank 2") { d -> sensors(d, 4, "Abgas B2 S", "°C") { it / 10.0 - 40 } }
+        add(0x7A, 7, "Partikelfilter Druck Bank 1") { d -> dpfPressure(d) }
+        add(0x7B, 7, "Partikelfilter Druck Bank 2") { d -> dpfPressure(d) }
+        add(0x7C, 9, "Partikelfilter-Temperatur") { d ->
+            listOfNotNull(
+                bit(d, 0)?.let { PidValue(".b1_ein", "DPF B1 Eingang", ab2(d, 1) / 10.0 - 40, "°C") },
+                bit(d, 1)?.let { PidValue(".b1_aus", "DPF B1 Ausgang", ab2(d, 3) / 10.0 - 40, "°C") },
+                bit(d, 2)?.let { PidValue(".b2_ein", "DPF B2 Eingang", ab2(d, 5) / 10.0 - 40, "°C") },
+                bit(d, 3)?.let { PidValue(".b2_aus", "DPF B2 Ausgang", ab2(d, 7) / 10.0 - 40, "°C") },
+            )
+        }
+        add(0x7F, 13, "Motorlaufzeit") { d ->
+            fun u32(o: Int) = ((d[o].toLong() shl 24) + (d[o + 1] shl 16) + (d[o + 2] shl 8) + d[o + 3]).toDouble()
+            listOfNotNull(
+                bit(d, 0)?.let { PidValue(".gesamt", "Laufzeit gesamt", u32(1), "s") },
+                bit(d, 1)?.let { PidValue(".leerlauf", "Laufzeit Leerlauf", u32(5), "s") },
+                bit(d, 2)?.let { PidValue(".pto", "Laufzeit Nebenabtrieb", u32(9), "s") },
+            )
+        }
+        add(0x84, 1, "Saugrohr-Oberflächentemperatur", one("Saugrohr-Oberfläche", "°C") { it[0] - 40.0 })
+        add(0x8D, 1, "Drosselklappe G", one("DK G", "%") { it[0] * 100.0 / 255 })
+        add(0x8E, 1, "Reibmoment", one("Reibmoment", "%") { it[0] - 125.0 })
         add(0xA6, 4, "Kilometerstand") { d ->
             listOf(PidValue("", "Kilometerstand", ((d[0].toLong() shl 24) + (d[1] shl 16) + (d[2] shl 8) + d[3]) / 10.0, "km"))
         }
     }.associateBy { it.pid }
 
     fun isBitmapPid(pid: Int) = pid % 0x20 == 0
+
+    /** PIDs whose value does not change while driving – read once per trip instead of in the polling loop */
+    val STATIC_PIDS = setOf(0x13, 0x1C, 0x1D, 0x5F, 0x63, 0x64)
 }

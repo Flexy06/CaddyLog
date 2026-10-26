@@ -1,0 +1,728 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 24190b4..fafc990 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -12,8 +12,8 @@ android {
+         applicationId = "de.flexy.caddylog"
+         minSdk = 31
+         targetSdk = 36
+-        versionCode = 2
+-        versionName = "0.2"
++        versionCode = 3
++        versionName = "0.3"
+     }
+ 
+     // Fixed debug key (committed on purpose): APKs from GitHub Actions and from Android Studio have the
+diff --git a/app/src/main/java/de/flexy/caddylog/core/Elm327.kt b/app/src/main/java/de/flexy/caddylog/core/Elm327.kt
+index 132acfb..a2675c6 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/Elm327.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/Elm327.kt
+@@ -51,7 +51,7 @@ fun IntArray.toAscii() = map { if (it in 0x20..0x7E) it.toChar() else '.' }.join
+  */
+ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _, _ -> }) {
+ 
+-    enum class Mode { UNKNOWN, OBD, RAW_CAN }
++    enum class Mode { UNKNOWN, OBD, RAW_CAN, KWP_PHYSICAL }
+ 
+     var mode = Mode.UNKNOWN
+         private set
+@@ -73,6 +73,19 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
+      */
+     var responseCountSupported: Boolean? = null
+ 
++    /**
++     * K-Line: the session was closed (ATPC / address change), the next request triggers a new 5-baud or fast init.
++     * That takes ~2–5 s – longer than a normal request timeout – so the next request must wait longer.
++     */
++    var busInitPending = false
++
++    /** K-Line: ECU address of a physical KWP2000 session (VW measuring blocks), null = normal OBD (functional 0x33) */
++    var kwpTarget: Int? = null
++        private set
++
++    /** timeout for the next request: long if a K-Line (re)initialisation is due */
++    fun timeoutFor(normalMs: Long): Long = if (busInitPending && bus != Bus.CAN) maxOf(normalMs, 9_000) else normalMs
++
+     private var lastHeader = -1
+     private var lastReceiveFilter = -1
+ 
+@@ -125,6 +138,7 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
+         info["Bus"] = bus.label
+         info["Antwort 0100"] = r
+         mode = Mode.OBD
++        kwpTarget = null; busInitPending = false
+         lastHeader = 0x7DF; lastReceiveFilter = -1
+         return info
+     }
+@@ -134,6 +148,7 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
+         if (mode == Mode.OBD) return
+         if (bus == Bus.KLINE) {
+             // K-Line: keep the adapter's default KWP header (ATSH with an 11-bit CAN id would break it)
++            if (kwpTarget != null) restoreKLineDefaults()
+             cmd("ATH1"); cmd("ATS1"); cmd("ATAT1")
+         } else {
+             cmd("ATH1"); cmd("ATS1"); cmd("ATCAF1"); cmd("ATAR"); cmd("ATSH7DF"); cmd("ATAT1"); cmd("ATST32")
+@@ -146,6 +161,40 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
+     suspend fun reinitBus() {
+         cmd("ATPC")
+         mode = Mode.UNKNOWN
++        busInitPending = true
++    }
++
++    private val isoSlowInit get() = protocolNumber == "3" || protocolNumber == "4"
++
++    /**
++     * K-Line: physical KWP2000 session to one ECU (VW address, e.g. 0x01 engine) for VW measuring blocks.
++     * Closes the OBD session; the next request initialises the bus with the ECU's address.
++     * ensureObd() switches back to the standard OBD addressing.
++     */
++    suspend fun ensureKwpPhysical(module: Int) {
++        check(bus == Bus.KLINE) { "Physische KWP-Adressierung nur über K-Line" }
++        if (mode == Mode.KWP_PHYSICAL && kwpTarget == module) return
++        cmd("ATPC")
++        if (isoSlowInit) cmd("ATIIA%02X".format(module))      // 5-baud init address
++        cmd("ATSH81%02XF1".format(module))                      // format 81 (physical), target, tester F1
++        cmd("ATWM81%02XF13E".format(module))                    // keep-alive = TesterPresent to this ECU
++        cmd("ATH1"); cmd("ATS1"); cmd("ATAT1")
++        kwpTarget = module
++        mode = Mode.KWP_PHYSICAL
++        busInitPending = true
++    }
++
++    /** back to the adapter defaults for OBD on K-Line (functional address 0x33) */
++    private suspend fun restoreKLineDefaults() {
++        cmd("ATPC")
++        if (protocolNumber == "3") {
++            cmd("ATSH686AF1"); cmd("ATWM686AF10100")
++        } else {
++            cmd("ATSHC133F1"); cmd("ATWMC133F13E")
++        }
++        if (isoSlowInit) cmd("ATIIA33")
++        kwpTarget = null
++        busInitPending = true
+     }
+ 
+     /** Raw CAN mode: no auto formatting (PCI bytes are ours), fixed short timeout. Used for VW TP2.0. */
+diff --git a/app/src/main/java/de/flexy/caddylog/core/LiveSampler.kt b/app/src/main/java/de/flexy/caddylog/core/LiveSampler.kt
+index 2efc58d..619e4d7 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/LiveSampler.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/LiveSampler.kt
+@@ -48,6 +48,8 @@ class LiveSampler(
+ 
+     companion object {
+         val DEFAULT_PRIORITY = listOf(0x0C, 0x0D, 0x04, 0x0F, 0x0B, 0x11)
++        /** polled with priority only if the ECU reports them as supported (oil temp., exhaust gas / DPF temp.) */
++        val OPTIONAL_PRIORITY = listOf(0x5C, 0x78, 0x7C)
+         val RATE_STEPS = listOf(5.0, 2.0, 1.0, 0.5)
+ 
+         fun nextLower(hz: Double): Double? = RATE_STEPS.firstOrNull { it < hz - 1e-9 }
+diff --git a/app/src/main/java/de/flexy/caddylog/core/Obd.kt b/app/src/main/java/de/flexy/caddylog/core/Obd.kt
+index adbf572..fd913ea 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/Obd.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/Obd.kt
+@@ -14,10 +14,11 @@ class Obd(private val elm: Elm327) {
+         val useCount = expectOne && elm.bus == Bus.KLINE && elm.responseCountSupported != false
+         val r = try {
+             elm.ensureObd()
+-            val first = elm.cmd(bytes.toHex("") + if (useCount) "1" else "", timeoutMs)
++            val t = elm.timeoutFor(timeoutMs)
++            val first = elm.cmd(bytes.toHex("") + if (useCount) "1" else "", t)
+             if (useCount && first.lines().any { it.trim() == "?" }) {
+                 elm.responseCountSupported = false   // old/clone adapter: fall back to normal requests
+-                elm.cmd(bytes.toHex(""), timeoutMs)
++                elm.cmd(bytes.toHex(""), elm.timeoutFor(timeoutMs))
+             } else {
+                 if (useCount && !Elm327.isError(first)) elm.responseCountSupported = true
+                 first
+@@ -52,6 +53,8 @@ class Obd(private val elm: Elm327) {
+             r.isBlank() -> ReadStatus.NO_DATA
+             else -> ReadStatus.INVALID
+         }
++        // bus answered (or at least initialised) → normal timeouts again
++        if (status == ReadStatus.OK || status == ReadStatus.NO_DATA || status == ReadStatus.INVALID) elm.busInitPending = false
+         return Response(status, payloads, r, busInit)
+     }
+ 
+diff --git a/app/src/main/java/de/flexy/caddylog/core/ObdPids.kt b/app/src/main/java/de/flexy/caddylog/core/ObdPids.kt
+index b1e4d8b..a54adff 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/ObdPids.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/ObdPids.kt
+@@ -23,6 +23,31 @@ object ObdPids {
+     private fun ab(d: IntArray) = d[0] * 256 + d[1]
+     private fun cd(d: IntArray) = d[2] * 256 + d[3]
+     private fun s16(v: Int) = if (v >= 32768) v - 65536 else v
++    private fun ab2(d: IntArray, o: Int) = d[o] * 256 + d[o + 1]
++
++    /** multi-sensor PIDs: bit i of byte A says whether sensor i exists (null → leave the value out) */
++    private fun bit(d: IntArray, i: Int): Unit? = if ((d[0] shr i) and 1 == 1) Unit else null
++
++    /** byte A = sensor bitmask, then [n] 2-byte values */
++    private fun sensors(d: IntArray, n: Int, name: String, unit: String, f: (Int) -> Double) =
++        (0 until n).mapNotNull { i -> bit(d, i)?.let { PidValue(".s${i + 1}", "$name${i + 1}", f(ab2(d, 1 + 2 * i)), unit) } }
++
++    /** byte A = sensor bitmask, then [n] 1-byte values */
++    private fun sensors1(d: IntArray, n: Int, name: String, unit: String, f: (Int) -> Double) =
++        (0 until n).mapNotNull { i -> bit(d, i)?.let { PidValue(".s${i + 1}", "$name ${i + 1}", f(d[1 + i]), unit) } }
++
++    private fun turboTemps(d: IntArray) = listOfNotNull(
++        bit(d, 0)?.let { PidValue(".v_ein", "Verdichter Eingang", d[1] - 40.0, "°C") },
++        bit(d, 1)?.let { PidValue(".v_aus", "Verdichter Ausgang", d[2] - 40.0, "°C") },
++        bit(d, 2)?.let { PidValue(".t_ein", "Turbine Eingang", ab2(d, 3) / 10.0 - 40, "°C") },
++        bit(d, 3)?.let { PidValue(".t_aus", "Turbine Ausgang", ab2(d, 5) / 10.0 - 40, "°C") },
++    )
++
++    private fun dpfPressure(d: IntArray) = listOfNotNull(
++        bit(d, 0)?.let { PidValue(".delta", "Differenzdruck", ab2(d, 1) * 0.01, "kPa") },
++        bit(d, 1)?.let { PidValue(".ein", "Eingangsdruck", ab2(d, 3) * 0.01, "kPa") },
++        bit(d, 2)?.let { PidValue(".aus", "Ausgangsdruck", ab2(d, 5) * 0.01, "kPa") },
++    )
+ 
+     private val FUEL_SYSTEM = mapOf(
+         0 to "aus", 1 to "Open loop (zu kalt)", 2 to "Closed loop (Lambda)", 4 to "Open loop (Last/Schub)",
+@@ -148,10 +173,59 @@ object ObdPids {
+         add(0x61, 1, "Fahrerwunsch-Moment", one("Wunschmoment", "%") { it[0] - 125.0 })
+         add(0x62, 1, "Ist-Moment", one("Ist-Moment", "%") { it[0] - 125.0 })
+         add(0x63, 2, "Referenzmoment", one("Referenzmoment", "Nm") { ab(it).toDouble() })
++
++        // ---- PIDs 0x64+ (multi-sensor PIDs: byte A = bitmask which sensors exist, then the values) ----
++        add(0x64, 5, "Motormoment-Kennpunkte") { d ->
++            (0..4).map { i -> PidValue(".$i", "Punkt ${i + 1}", d[i] - 125.0, "%") }
++        }
++        add(0x66, 5, "Luftmassenmesser (Sensoren)") { d -> sensors(d, 2, "MAF ", "g/s") { it / 32.0 } }
++        add(0x67, 3, "Kühlmitteltemperatur (Sensoren)") { d -> sensors1(d, 2, "Kühlmittel", "°C") { it - 40.0 } }
++        add(0x68, 7, "Ansauglufttemperatur (Sensoren)") { d -> sensors1(d, 6, "Ansaugluft", "°C") { it - 40.0 } }
++        add(0x6B, 5, "AGR-Temperatur") { d -> sensors1(d, 4, "AGR-Temp", "°C") { it - 40.0 } }
++        add(0x6F, 3, "Verdichter-Eingangsdruck") { d -> sensors1(d, 2, "Turbo-Eingang", "kPa") { it.toDouble() } }
++        add(0x70, 10, "Ladedruckregelung") { d ->
++            listOfNotNull(
++                bit(d, 0)?.let { PidValue(".soll_a", "Ladedruck soll A", ab2(d, 1) * 0.03125, "kPa") },
++                bit(d, 1)?.let { PidValue(".ist_a", "Ladedruck ist A", ab2(d, 3) * 0.03125, "kPa") },
++                bit(d, 2)?.let { PidValue(".soll_b", "Ladedruck soll B", ab2(d, 5) * 0.03125, "kPa") },
++                bit(d, 3)?.let { PidValue(".ist_b", "Ladedruck ist B", ab2(d, 7) * 0.03125, "kPa") },
++            )
++        }
++        add(0x73, 5, "Abgasdruck") { d -> sensors(d, 2, "Abgasdruck Bank ", "kPa") { it * 0.01 } }
++        add(0x74, 5, "Turboladerdrehzahl") { d -> sensors(d, 2, "Turbo ", "1/min") { it * 10.0 } }
++        add(0x75, 7, "Turbolader-Temperatur A") { d -> turboTemps(d) }
++        add(0x76, 7, "Turbolader-Temperatur B") { d -> turboTemps(d) }
++        add(0x77, 5, "Ladeluftkühler-Temperatur") { d -> sensors1(d, 4, "LLK-Temp", "°C") { it - 40.0 } }
++        add(0x78, 9, "Abgastemperatur Bank 1") { d -> sensors(d, 4, "Abgas B1 S", "°C") { it / 10.0 - 40 } }
++        add(0x79, 9, "Abgastemperatur Bank 2") { d -> sensors(d, 4, "Abgas B2 S", "°C") { it / 10.0 - 40 } }
++        add(0x7A, 7, "Partikelfilter Druck Bank 1") { d -> dpfPressure(d) }
++        add(0x7B, 7, "Partikelfilter Druck Bank 2") { d -> dpfPressure(d) }
++        add(0x7C, 9, "Partikelfilter-Temperatur") { d ->
++            listOfNotNull(
++                bit(d, 0)?.let { PidValue(".b1_ein", "DPF B1 Eingang", ab2(d, 1) / 10.0 - 40, "°C") },
++                bit(d, 1)?.let { PidValue(".b1_aus", "DPF B1 Ausgang", ab2(d, 3) / 10.0 - 40, "°C") },
++                bit(d, 2)?.let { PidValue(".b2_ein", "DPF B2 Eingang", ab2(d, 5) / 10.0 - 40, "°C") },
++                bit(d, 3)?.let { PidValue(".b2_aus", "DPF B2 Ausgang", ab2(d, 7) / 10.0 - 40, "°C") },
++            )
++        }
++        add(0x7F, 13, "Motorlaufzeit") { d ->
++            fun u32(o: Int) = ((d[o].toLong() shl 24) + (d[o + 1] shl 16) + (d[o + 2] shl 8) + d[o + 3]).toDouble()
++            listOfNotNull(
++                bit(d, 0)?.let { PidValue(".gesamt", "Laufzeit gesamt", u32(1), "s") },
++                bit(d, 1)?.let { PidValue(".leerlauf", "Laufzeit Leerlauf", u32(5), "s") },
++                bit(d, 2)?.let { PidValue(".pto", "Laufzeit Nebenabtrieb", u32(9), "s") },
++            )
++        }
++        add(0x84, 1, "Saugrohr-Oberflächentemperatur", one("Saugrohr-Oberfläche", "°C") { it[0] - 40.0 })
++        add(0x8D, 1, "Drosselklappe G", one("DK G", "%") { it[0] * 100.0 / 255 })
++        add(0x8E, 1, "Reibmoment", one("Reibmoment", "%") { it[0] - 125.0 })
+         add(0xA6, 4, "Kilometerstand") { d ->
+             listOf(PidValue("", "Kilometerstand", ((d[0].toLong() shl 24) + (d[1] shl 16) + (d[2] shl 8) + d[3]) / 10.0, "km"))
+         }
+     }.associateBy { it.pid }
+ 
+     fun isBitmapPid(pid: Int) = pid % 0x20 == 0
++
++    /** PIDs whose value does not change while driving – read once per trip instead of in the polling loop */
++    val STATIC_PIDS = setOf(0x13, 0x1C, 0x1D, 0x5F, 0x63, 0x64)
+ }
+diff --git a/app/src/main/java/de/flexy/caddylog/core/VehicleData.kt b/app/src/main/java/de/flexy/caddylog/core/VehicleData.kt
+index eb7a48b..574bcc5 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/VehicleData.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/VehicleData.kt
+@@ -35,7 +35,10 @@ enum class Signal(val pid: Int?, val label: String, val unit: String, val csv: S
+     MAP(0x0B, "Saugrohrdruck", "kPa", "map_kpa", 20.0, 110.0),
+     THROTTLE(0x11, "Drosselklappe", "%", "throttle_pct", 0.0, 100.0),
+     ECU_VOLTAGE(0x42, "Steuergerätespannung", "V", "ecu_v", 10.0, 15.5),
+-    BATTERY(null, "Bordnetz (Adapter)", "V", "battery_v", 10.0, 15.5);
++    BATTERY(null, "Bordnetz (Adapter)", "V", "battery_v", 10.0, 15.5),
++    // appended at the end so existing trip_series.csv columns keep their position
++    OIL_TEMP(0x5C, "Öltemperatur", "°C", "oil_c", 40.0, 140.0),
++    EXHAUST_TEMP(0x78, "Abgastemperatur", "°C", "egt_c", 0.0, 800.0);
+ 
+     companion object {
+         fun forPid(pid: Int) = entries.firstOrNull { it.pid == pid }
+diff --git a/app/src/main/java/de/flexy/caddylog/core/Vw.kt b/app/src/main/java/de/flexy/caddylog/core/Vw.kt
+index b1b6710..bb78d71 100644
+--- a/app/src/main/java/de/flexy/caddylog/core/Vw.kt
++++ b/app/src/main/java/de/flexy/caddylog/core/Vw.kt
+@@ -6,13 +6,18 @@ package de.flexy.caddylog.core
+  *
+  * Only READ services are ever sent (session start, identification, read DTCs, read measuring blocks).
+  */
+-class Tp20(private val elm: Elm327, val module: Int, private val log: (String) -> Unit = {}) {
++class Tp20(private val elm: Elm327, override val module: Int, private val log: (String) -> Unit = {}) : KwpChannel {
+     var txId = -1; private set
+     var rxId = -1; private set
+-    var isOpen = false; private set
++    override var isOpen = false; private set
+     private var txSeq = 0
+ 
+-    suspend fun open(): Boolean {
++    override suspend fun kwp(vararg req: Int): IntArray? = request(*req)
++
++    override fun describe(): Map<String, Any?> =
++        mapOf("transport" to "CAN TP2.0", "tp20_tx" to "%03X".format(txId), "tp20_rx" to "%03X".format(rxId))
++
++    override suspend fun open(): Boolean {
+         isOpen = false
+         elm.ensureRawCan()
+         elm.target(0x200, 0x200 + module)
+@@ -98,7 +103,7 @@ class Tp20(private val elm: Elm327, val module: Int, private val log: (String) -
+         return Elm327.parseFrames(r).any { it.id == rxId && it.data.isNotEmpty() && it.data[0] == 0xA1 }
+     }
+ 
+-    suspend fun close() {
++    override suspend fun close() {
+         if (!isOpen) return
+         runCatching { elm.ensureRawCan(); elm.target(txId, rxId); elm.cmd("A8", 800) }
+         isOpen = false
+@@ -133,26 +138,28 @@ class Vw(private val elm: Elm327, private val log: (String) -> Unit = {}) {
+         }
+     }
+ 
++    /** CAN → TP2.0, K-Line → physical KWP2000 session */
++    private fun channel(module: Int): KwpChannel =
++        if (elm.bus == Bus.KLINE) KwpKLine(elm, module, log) else Tp20(elm, module, log)
++
+     /** Scans one module. groups = measuring block numbers to read (KWP 21 xx). */
+     suspend fun scanModule(module: Int, groups: IntRange, progress: (String) -> Unit, onReading: (Reading) -> Unit): Map<String, Any?>? {
+-        val ch = Tp20(elm, module, log)
++        val ch = channel(module)
+         if (!ch.open()) return null
+-        val rep = linkedMapOf<String, Any?>(
+-            "address" to "%02X".format(module), "name" to name(module),
+-            "tp20_tx" to "%03X".format(ch.txId), "tp20_rx" to "%03X".format(ch.rxId)
+-        )
++        val rep = linkedMapOf<String, Any?>("address" to "%02X".format(module), "name" to name(module))
++        rep.putAll(ch.describe())
+         try {
+             progress("SG %02X %s: Identifikation".format(module, name(module)))
+             val ident = linkedMapOf<String, Any?>()
+             for (opt in listOf(0x9B, 0x9A, 0x91, 0x86, 0x8A)) {
+-                val r = ch.request(0x1A, opt) ?: continue
++                val r = ch.kwp(0x1A, opt) ?: continue
+                 ident["1A%02X".format(opt)] = mapOf("raw" to r.toHex(""), "ascii" to r.copyOfRange(minOf(2, r.size), r.size).toAscii(), "positive" to (r[0] == 0x5A))
+                 if (opt == 0x9B && r[0] == 0x5A) onReading(Reading("VW.%02X.IDENT".format(module), "SG %02X Identifikation".format(module), null, "", r.copyOfRange(2, r.size).toAscii(), r.toHex("")))
+             }
+             rep["identification"] = ident
+ 
+             progress("SG %02X: Fehlerspeicher".format(module))
+-            val d = ch.request(0x18, 0x02, 0xFF, 0x00)
++            val d = ch.kwp(0x18, 0x02, 0xFF, 0x00)
+             rep["dtc_raw"] = d?.toHex("")
+             if (d != null && d.size >= 2 && d[0] == 0x58) {
+                 rep["dtcs"] = d.copyOfRange(2, d.size).toList().chunked(3).filter { it.size == 3 }.map { dtc(it[0], it[1], it[2]) }
+@@ -162,7 +169,7 @@ class Vw(private val elm: Elm327, private val log: (String) -> Unit = {}) {
+             var consecutiveFails = 0
+             for (g in groups) {
+                 progress("SG %02X: Messwertblock %03d".format(module, g))
+-                val r = ch.request(0x21, g)
++                val r = ch.kwp(0x21, g)
+                 if (r == null) {
+                     consecutiveFails++
+                     // channel lost? reopen once
+diff --git a/app/src/main/java/de/flexy/caddylog/core/VwKLine.kt b/app/src/main/java/de/flexy/caddylog/core/VwKLine.kt
+new file mode 100644
+index 0000000..37cf712
+--- /dev/null
++++ b/app/src/main/java/de/flexy/caddylog/core/VwKLine.kt
+@@ -0,0 +1,73 @@
++package de.flexy.caddylog.core
++
++/** A KWP2000 connection to one VW control unit – over CAN (TP2.0) or K-Line (physical ISO 14230 session). */
++interface KwpChannel {
++    val module: Int
++    val isOpen: Boolean
++    suspend fun open(): Boolean
++    /** sends a READ request and returns the ECU's response payload (e.g. 61 01 …), null on timeout */
++    suspend fun kwp(vararg req: Int): IntArray?
++    suspend fun close()
++    /** transport details for the scan report */
++    fun describe(): Map<String, Any?>
++}
++
++/**
++ * VW measuring blocks on older VAG cars whose ECUs are only reachable via K-Line (Caddy 2K up to ~2010,
++ * T5 up to ~2009 …): physical KWP2000 session to the ECU address (01 = engine), then "21 xx" = read group xx.
++ *
++ * Limitations: ECUs that only speak the old KW1281 protocol (most cars before ~2002) cannot be read with an ELM327.
++ * Only READ services are sent (10 89 session, 1A identification, 18 DTCs, 21 measuring blocks).
++ */
++class KwpKLine(private val elm: Elm327, override val module: Int, private val log: (String) -> Unit = {}) : KwpChannel {
++
++    override var isOpen = false
++        private set
++    private var sessionAnswer: String? = null
++
++    override suspend fun open(): Boolean {
++        isOpen = false
++        elm.ensureKwpPhysical(module)
++        // first request initialises the K-Line with the ECU address – takes a few seconds
++        val r = exchange(intArrayOf(0x10, 0x89), elm.timeoutFor(3000))
++        if (r == null) {
++            log("SG %02X antwortet nicht über K-Line (KWP2000)".format(module))
++            return false
++        }
++        elm.busInitPending = false
++        sessionAnswer = r.toHex("")
++        isOpen = true
++        log("K-Line-Sitzung zu SG %02X offen (Antwort auf 10 89: %s)".format(module, r.toHex()))
++        return true
++    }
++
++    override suspend fun kwp(vararg req: Int): IntArray? {
++        if (!isOpen) return null
++        elm.ensureKwpPhysical(module)
++        return exchange(req, 3000)
++    }
++
++    /**
++     * One request. Frames with "response pending" (7F xx 78) are skipped – usually the real answer is in the same
++     * adapter response. If only "pending" came back, the (read-only, idempotent) request is repeated.
++     */
++    private suspend fun exchange(req: IntArray, timeoutMs: Long): IntArray? {
++        repeat(3) {
++            val text = elm.cmd(req.toHex(""), timeoutMs)
++            val frames = KLine.parse(text).frames.filter { it.checksumOk != false && it.source == module && it.data.isNotEmpty() }
++            val answer = frames.lastOrNull { f -> !(f.data.size >= 3 && f.data[0] == 0x7F && f.data[2] == 0x78) }
++            if (answer != null) return answer.data
++            if (frames.isEmpty()) return null
++        }
++        return null
++    }
++
++    override suspend fun close() {
++        isOpen = false
++        // the OBD addressing is restored by Elm327.ensureObd() before the next OBD request
++    }
++
++    override fun describe(): Map<String, Any?> = mapOf(
++        "transport" to "K-Line KWP2000 (physisch)", "protocol" to elm.protocolNumber, "session_10_89" to sessionAnswer,
++    )
++}
+diff --git a/app/src/main/java/de/flexy/caddylog/data/LoggerEngine.kt b/app/src/main/java/de/flexy/caddylog/data/LoggerEngine.kt
+index 80ff50a..ad72caf 100644
+--- a/app/src/main/java/de/flexy/caddylog/data/LoggerEngine.kt
++++ b/app/src/main/java/de/flexy/caddylog/data/LoggerEngine.kt
+@@ -194,7 +194,7 @@ object LoggerEngine {
+         e.protocolNumber?.let { p -> if (p != Settings.current.preferredProtocol) Settings.update { it.copy(preferredProtocol = p) } }
+         val full = linkedMapOf("Gerät" to "${device.name} (${device.address})", "BLE" to l.description) + info
+         session?.writeJson("meta.json", mapOf(
+-            "app" to "CaddyLog 0.2", "fahrzeug" to "VW Caddy Maxi 2.0 EcoFuel (CNG), 2010",
++            "app" to "CaddyLog 0.3", "fahrzeug" to Settings.current.vehicleName,
+             "android" to "${Build.MANUFACTURER} ${Build.MODEL} / SDK ${Build.VERSION.SDK_INT}",
+             "adapter" to full, "start" to java.time.Instant.now().toString()
+         ))
+@@ -361,12 +361,16 @@ object LoggerEngine {
+     }
+ 
+     fun runVwScan(allAddresses: Boolean, groups: IntRange) {
+-        if (elm?.bus == Bus.KLINE) {
+-            addProgress("VW-TP2.0-Scan übersprungen: Das Fahrzeug kommuniziert über K-Line (ISO 14230-4). TP2.0 ist nur über CAN möglich.")
+-            return
+-        }
+-        launchTask("VW-Steuergeräte-Scan") { e ->
+-            val modules = if (allAddresses) (0x01..0x7F).toList() else Vw.MODULE_NAMES.keys.sorted()
++        val kLine = elm?.bus == Bus.KLINE
++        launchTask(if (kLine) "VW-Messwertblöcke (K-Line)" else "VW-Steuergeräte-Scan") { e ->
++            val modules = when {
++                // K-Line: every address costs a full bus init (~3–5 s) → engine first, the usual K-Line modules on request
++                kLine && allAddresses -> listOf(0x01, 0x02, 0x03, 0x08, 0x15, 0x17, 0x25)
++                kLine -> listOf(0x01)
++                allAddresses -> (0x01..0x7F).toList()
++                else -> Vw.MODULE_NAMES.keys.sorted()
++            }
++            if (kLine) addProgress("K-Line: Lese Messwertblöcke über eine KWP2000-Sitzung direkt mit dem Steuergerät. Live-Werte pausieren währenddessen.")
+             val report = Vw(e, ::addProgress).scanAll(modules, groups, ::addProgress, ::onReading)
+             session?.writeJson("scan_vw_${stamp()}.json", report)
+             @Suppress("UNCHECKED_CAST")
+diff --git a/app/src/main/java/de/flexy/caddylog/data/Settings.kt b/app/src/main/java/de/flexy/caddylog/data/Settings.kt
+index e890c79..96b4f26 100644
+--- a/app/src/main/java/de/flexy/caddylog/data/Settings.kt
++++ b/app/src/main/java/de/flexy/caddylog/data/Settings.kt
+@@ -29,7 +29,14 @@ data class AppSettings(
+     val preferredProtocol: String? = null,
+     val allTimeMax: Double? = null,
+     val allTimeMaxMs: Long? = null,
++    /** written into meta.json of every session, so the logs of different cars can be told apart */
++    val vehicleName: String = VEHICLE_CADDY,
+ ) {
++    companion object {
++        const val VEHICLE_CADDY = "VW Caddy Maxi 2.0 EcoFuel (CNG), 2010"
++        const val VEHICLE_T5 = "VW T5, ca. 2006"
++    }
++
+     fun thresholds() = CoolantThresholds(
+         elevated = elevated, warning = warning, strong = strong, critical = critical, extreme = extreme,
+         hysteresis = hysteresis, riseRatePerMin = riseRatePerMin, riseDelta = riseDelta,
+@@ -63,7 +70,11 @@ object Settings {
+             preferredProtocol = prefs.getString("protocol", null),
+             allTimeMax = prefs.getString("allTimeMax", null)?.toDoubleOrNull(),
+             allTimeMaxMs = prefs.getLong("allTimeMaxMs", 0).takeIf { it > 0 },
+-        ).let { if (it.isValid()) it else d.copy(preferredProtocol = it.preferredProtocol, allTimeMax = it.allTimeMax, allTimeMaxMs = it.allTimeMaxMs) }
++            vehicleName = prefs.getString("vehicleName", null)?.takeIf { it.isNotBlank() } ?: d.vehicleName,
++        ).let {
++            if (it.isValid()) it
++            else d.copy(preferredProtocol = it.preferredProtocol, allTimeMax = it.allTimeMax, allTimeMaxMs = it.allTimeMaxMs, vehicleName = it.vehicleName)
++        }
+     }
+ 
+     @Synchronized
+@@ -83,6 +94,7 @@ object Settings {
+             if (n.preferredProtocol != null) putString("protocol", n.preferredProtocol) else remove("protocol")
+             if (n.allTimeMax != null) putString("allTimeMax", n.allTimeMax.toString()) else remove("allTimeMax")
+             putLong("allTimeMaxMs", n.allTimeMaxMs ?: 0)
++            putString("vehicleName", n.vehicleName)
+         }.apply()
+         return true
+     }
+diff --git a/app/src/main/java/de/flexy/caddylog/monitor/MonitorEngine.kt b/app/src/main/java/de/flexy/caddylog/monitor/MonitorEngine.kt
+index 16de260..707b368 100644
+--- a/app/src/main/java/de/flexy/caddylog/monitor/MonitorEngine.kt
++++ b/app/src/main/java/de/flexy/caddylog/monitor/MonitorEngine.kt
+@@ -236,6 +236,15 @@ object MonitorEngine {
+         val sup = LoggerEngine.withElm { Obd(it).supported(0x01) } ?: emptyMap()
+         supportedPids = sup.values.flatten().toSet()
+         if (sup.isNotEmpty()) LoggerEngine.supported.value = sup
++        if (supportedPids.isNotEmpty()) {
++            LoggerEngine.note("Unterstützte Mode-01-PIDs: " + supportedPids.filter { !ObdPids.isBitmapPid(it) }.sorted()
++                .joinToString(" ") { "%02X".format(it) } + " – alle werden aufgezeichnet")
++        }
++        // values that never change while driving: read once per connection, not in every polling round
++        for (pid in supportedPids.filter { it in ObdPids.STATIC_PIDS }.sorted()) {
++            val r = LoggerEngine.withElm { Obd(it).readPid(pid) } ?: break
++            if (r.status == ReadStatus.OK) LoggerEngine.logReadings(r.readings)
++        }
+         ui.update { st ->
+             st.copy(signals = st.signals.mapValues { (sig, ss) ->
+                 if (sig.pid == null || supportedPids.isEmpty()) ss else ss.copy(supported = sig.pid in supportedPids || sig == Signal.COOLANT)
+@@ -245,8 +254,10 @@ object MonitorEngine {
+ 
+     private fun samplerConfig(): LiveSampler.Config {
+         val sup = supportedPids
+-        val priority = LiveSampler.DEFAULT_PRIORITY.filter { sup.isEmpty() || it in sup }
+-        val other = sup.filter { it != 0x05 && it !in priority && !ObdPids.isBitmapPid(it) }.sorted()
++        val priority = LiveSampler.DEFAULT_PRIORITY.filter { sup.isEmpty() || it in sup } +
++            LiveSampler.OPTIONAL_PRIORITY.filter { it in sup }
++        // everything else the ECU supports is polled round-robin – so every available sensor ends up in live.csv
++        val other = sup.filter { it != 0x05 && it !in priority && !ObdPids.isBitmapPid(it) && it !in ObdPids.STATIC_PIDS }.sorted()
+         return LiveSampler.Config(targetHz = Settings.current.sampleHz, priorityPids = priority, otherPids = other)
+     }
+ 
+diff --git a/app/src/main/java/de/flexy/caddylog/ui/Chart.kt b/app/src/main/java/de/flexy/caddylog/ui/Chart.kt
+index 7eef27d..c28c1ed 100644
+--- a/app/src/main/java/de/flexy/caddylog/ui/Chart.kt
++++ b/app/src/main/java/de/flexy/caddylog/ui/Chart.kt
+@@ -63,6 +63,8 @@ val SIGNAL_COLORS: Map<Signal, Color> = mapOf(
+     Signal.THROTTLE to Color(0xFFEC4899),
+     Signal.ECU_VOLTAGE to Color(0xFF64748B),
+     Signal.BATTERY to Color(0xFF94A3B8),
++    Signal.OIL_TEMP to Color(0xFFA16207),
++    Signal.EXHAUST_TEMP to Color(0xFFDC2626),
+ )
+ 
+ fun formatSignal(sig: Signal, v: Double): String = when (sig) {
+diff --git a/app/src/main/java/de/flexy/caddylog/ui/Dashboard.kt b/app/src/main/java/de/flexy/caddylog/ui/Dashboard.kt
+index 8ce0769..66c3f59 100644
+--- a/app/src/main/java/de/flexy/caddylog/ui/Dashboard.kt
++++ b/app/src/main/java/de/flexy/caddylog/ui/Dashboard.kt
+@@ -274,7 +274,7 @@ fun TripSummaryCard(lines: List<String>, onDetails: () -> Unit, onClose: () -> U
+ @Composable
+ private fun SignalsCard(st: MonitorEngine.UiState, now: Long, maxAge: Long) {
+     DashCard("Motorwerte") {
+-        val list = listOf(Signal.RPM, Signal.SPEED, Signal.LOAD, Signal.IAT, Signal.MAP, Signal.THROTTLE, Signal.ECU_VOLTAGE, Signal.BATTERY)
++        val list = listOf(Signal.RPM, Signal.SPEED, Signal.LOAD, Signal.IAT, Signal.MAP, Signal.THROTTLE, Signal.OIL_TEMP, Signal.EXHAUST_TEMP, Signal.ECU_VOLTAGE, Signal.BATTERY)
+         for (sig in list) {
+             val s = st.signals[sig]
+             val fresh = s?.isFresh(now, maxAge) == true
+diff --git a/app/src/main/java/de/flexy/caddylog/ui/Screens.kt b/app/src/main/java/de/flexy/caddylog/ui/Screens.kt
+index 4acf4e0..e40f659 100644
+--- a/app/src/main/java/de/flexy/caddylog/ui/Screens.kt
++++ b/app/src/main/java/de/flexy/caddylog/ui/Screens.kt
+@@ -170,14 +170,17 @@ fun ScanScreen() {
+             Spacer(Modifier.height(8.dp))
+             Button(enabled = activity == null, onClick = LoggerEngine::readDtcs) { Text("Fehlerspeicher lesen") }
+         }
+-        if (kLine) Section("VW-Steuergeräte (TP2.0)") {
+-            Text("Nicht verfügbar: Dein Caddy kommuniziert über K-Line (ISO 14230-4). Der VW-TP2.0-Scan funktioniert nur über CAN " +
+-                    "und wird deshalb nicht ausgeführt.", style = MaterialTheme.typography.bodyMedium)
+-        } else Section("VW-Steuergeräte (TP2.0 / KWP2000)") {
+-            Text("Sucht alle Steuergeräte und liest Identifikation, Fehlerspeicher und Messwertblöcke. " +
++        Section(if (kLine) "VW-Messwertblöcke (K-Line, KWP2000)" else "VW-Steuergeräte (TP2.0 / KWP2000)") {
++            Text(if (kLine)
++                "Das Fahrzeug kommuniziert über K-Line. Die App baut eine KWP2000-Sitzung direkt zum Motorsteuergerät (Adresse 01) " +
++                    "auf und liest Identifikation, Fehlerspeicher und Messwertblöcke – dort stecken herstellerspezifische Werte " +
++                    "wie Abgas- oder Öltemperatur, falls das Auto sie hat. Nur lesend. Steuergeräte, die nur das alte KW1281 " +
++                    "sprechen, lassen sich mit einem ELM327 nicht auslesen."
++            else "Sucht alle Steuergeräte und liest Identifikation, Fehlerspeicher und Messwertblöcke. " +
+                     "Nur lesend. Am besten im Stand mit laufendem Motor.")
+             Row(verticalAlignment = Alignment.CenterVertically) {
+-                Checkbox(allAddresses, { allAddresses = it }); Text("Alle Adressen 01–7F (sonst ~45 bekannte)")
++                Checkbox(allAddresses, { allAddresses = it })
++                Text(if (kLine) "Weitere Steuergeräte (Getriebe, ABS, Klima, Airbag, Kombi, Wegfahrsperre)" else "Alle Adressen 01–7F (sonst ~45 bekannte)")
+             }
+             Row(verticalAlignment = Alignment.CenterVertically) {
+                 Checkbox(allGroups, { allGroups = it }); Text("Messwertblöcke 1–255 (sonst 1–50)")
+@@ -187,7 +190,7 @@ fun ScanScreen() {
+             Spacer(Modifier.height(8.dp))
+             Button(enabled = activity == null, onClick = {
+                 LoggerEngine.runVwScan(allAddresses, if (allGroups) 1..255 else 1..50)
+-            }) { Text("VW-Scan starten") }
++            }) { Text(if (kLine) "Messwertblöcke lesen" else "VW-Scan starten") }
+         }
+         RunningBar()
+         ProgressLog(Modifier.height(360.dp).fillMaxWidth())
+diff --git a/app/src/main/java/de/flexy/caddylog/ui/SettingsScreen.kt b/app/src/main/java/de/flexy/caddylog/ui/SettingsScreen.kt
+index cfa2578..282442f 100644
+--- a/app/src/main/java/de/flexy/caddylog/ui/SettingsScreen.kt
++++ b/app/src/main/java/de/flexy/caddylog/ui/SettingsScreen.kt
+@@ -31,6 +31,17 @@ fun SettingsScreen() {
+     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+         Text("Einstellungen", Modifier.padding(16.dp), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+ 
++        Section("Fahrzeug") {
++            Text("Steht in meta.json jeder Aufzeichnung. Die App liest unabhängig davon alle Sensoren, die das Steuergerät " +
++                    "meldet – ein anderes Auto wird automatisch erkannt (K-Line oder CAN).", style = MaterialTheme.typography.bodySmall)
++            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
++                for ((label, name) in listOf("Caddy" to AppSettings.VEHICLE_CADDY, "T5" to AppSettings.VEHICLE_T5)) {
++                    FilterChip(selected = f.vehicle == name, onClick = { f = f.copy(vehicle = name) }, label = { Text(label) })
++                }
++            }
++            OutlinedTextField(f.vehicle, { f = f.copy(vehicle = it) }, Modifier.fillMaxWidth().padding(vertical = 2.dp),
++                label = { Text("Bezeichnung") }, singleLine = true)
++        }
+         Section("Warnschwellen Kühlmittel (°C)") {
+             Text("Diagnostische Warnschwellen – ein Überschreiten bedeutet nicht automatisch einen Motorschaden.",
+                 style = MaterialTheme.typography.bodySmall)
+@@ -91,7 +102,7 @@ fun SettingsScreen() {
+                     MonitorEngine.applySettings()
+                 }
+             }) { Text("Speichern") }
+-            OutlinedButton(onClick = { f = SettingsForm.from(AppSettings().copy(preferredProtocol = saved.preferredProtocol)); message = null }) { Text("Standardwerte") }
++            OutlinedButton(onClick = { f = SettingsForm.from(AppSettings().copy(preferredProtocol = saved.preferredProtocol, vehicleName = saved.vehicleName)); message = null }) { Text("Standardwerte") }
+         }
+     }
+ }
+@@ -100,7 +111,7 @@ private data class SettingsForm(
+     val elevated: String, val warning: String, val strong: String, val critical: String, val extreme: String,
+     val hysteresis: String, val riseRate: String, val riseDelta: String, val sustainedMin: String,
+     val sampleHz: Double, val sound: Boolean, val vibrate: Boolean, val repeatSec: String, val ackRepeatSec: String,
+-    val autoTrip: Boolean, val autoReconnect: Boolean,
++    val autoTrip: Boolean, val autoReconnect: Boolean, val vehicle: String,
+ ) {
+     fun toSettings(base: AppSettings): AppSettings? {
+         fun d(s: String) = s.replace(',', '.').trim().toDoubleOrNull()
+@@ -111,6 +122,7 @@ private data class SettingsForm(
+             sustainedMin = d(sustainedMin) ?: return null, sampleHz = sampleHz, soundEnabled = sound, vibrate = vibrate,
+             repeatSec = d(repeatSec)?.toInt() ?: return null, ackRepeatSec = d(ackRepeatSec)?.toInt() ?: return null,
+             autoTrip = autoTrip, autoReconnect = autoReconnect,
++            vehicleName = vehicle.trim().ifEmpty { AppSettings.VEHICLE_CADDY },
+         )
+     }
+ 
+@@ -119,7 +131,7 @@ private data class SettingsForm(
+         fun from(s: AppSettings) = SettingsForm(
+             n(s.elevated), n(s.warning), n(s.strong), n(s.critical), n(s.extreme), n(s.hysteresis),
+             n(s.riseRatePerMin), n(s.riseDelta), n(s.sustainedMin), s.sampleHz, s.soundEnabled, s.vibrate,
+-            s.repeatSec.toString(), s.ackRepeatSec.toString(), s.autoTrip, s.autoReconnect,
++            s.repeatSec.toString(), s.ackRepeatSec.toString(), s.autoTrip, s.autoReconnect, s.vehicleName,
+         )
+     }
+ }
+diff --git a/app/src/test/java/de/flexy/caddylog/core/VwKLineTest.kt b/app/src/test/java/de/flexy/caddylog/core/VwKLineTest.kt
+new file mode 100644
+index 0000000..8602050
+--- /dev/null
++++ b/app/src/test/java/de/flexy/caddylog/core/VwKLineTest.kt
+@@ -0,0 +1,77 @@
++package de.flexy.caddylog.core
++
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** Fake Caddy: functional OBD answers from 0x10; physical KWP to 0x01 after ATPC/ATSH8101F1. */
++private class KLineVwLink : ElmLink {
++    val log = mutableListOf<String>()
++    var header = "C133F1"; var closed = false; var initDelayMs = 0L
++    override val isConnected = true
++    override suspend fun exchange(command: String, timeoutMs: Long): String {
++        log += "$command (t=$timeoutMs)"
++        val c = command.uppercase().replace(" ", "").let { if (Regex("^01[0-9A-F]{2}1$").matches(it)) it.dropLast(1) else it }
++        val r = when {
++            c == "ATDPN" -> "A4"; c == "ATDP" -> "AUTO, ISO 14230-4 (KWP 5BAUD)"; c == "ATRV" -> "13.0V"
++            c == "ATPC" -> { closed = true; "OK" }
++            c.startsWith("ATSH") -> { header = c.drop(4); "OK" }
++            c.startsWith("AT") -> "OK"
++            closed && timeoutMs < 4000 -> throw java.io.IOException("Zeitüberschreitung")   // 5-baud init needs ~4 s
++            header == "8101F1" -> { closed = false; when (c) {
++                "1089" -> kwp(0x50, 0x89, src = 0x01)
++                "1A9B" -> kwp(0x5A, 0x9B, 0x30, 0x33, 0x47, src = 0x01)
++                "1802FF00" -> kwp(0x58, 0x00, src = 0x01)
++                "2101" -> kwp(0x61, 0x01, 0x01, 0xC8, 0x1F, 0x05, 0x0A, 0x83, src = 0x01)  // rpm, coolant
++                "2102" -> kwp(0x7F, 0x21, 0x78, src = 0x01) + "\r" + kwp(0x61, 0x02, 0x05, 0x0A, 0x96, src = 0x01)
++                else -> kwp(0x7F, 0x21, 0x31, src = 0x01)
++            } }
++            header == "C133F1" -> { closed = false; when (c) {
++                "0105" -> kwp(0x41, 0x05, 0x85)
++                "0178" -> kwp(0x41, 0x78, 0x01, 0x1F, 0x40, 0, 0, 0, 0, 0, 0)  // EGT sensor 1 = 0x1F40/10-40 = 760 °C
++                "017C" -> kwp(0x41, 0x7C, 0x03, 0x0F, 0xA0, 0x0E, 0x10, 0, 0, 0, 0)
++                else -> "NO DATA"
++            } }
++            else -> "NO DATA"
++        }
++        return "$r\r\r>"
++    }
++}
++
++
++class VwKLineTest {
++
++    private fun setup(): Pair<KLineVwLink, Elm327> {
++        val link = KLineVwLink(); val elm = Elm327(link)
++        runBlocking { elm.initialize("4") }
++        return link to elm
++    }
++
++    @Test fun exhaustGasTemperatureOnlyPresentSensors() = runBlocking {
++        val (_, elm) = setup()
++        val r = Obd(elm).readPid(0x78)
++        assertEquals(760.0, r.value)
++        assertEquals(1, r.readings.size)
++        assertEquals(listOf(360.0, 320.0), Obd(elm).readPid(0x7C).readings.map { it.value })
++    }
++
++    @Test fun firstRequestAfterReinitWaitsForBusInit() = runBlocking {
++        val (_, elm) = setup()
++        elm.reinitBus()
++        assertEquals(93.0, Obd(elm).readPid(0x05).value)
++        assertFalse(elm.busInitPending)
++    }
++
++    @Test fun measuringBlocksOverKLineAndBackToObd() = runBlocking {
++        val (link, elm) = setup()
++        val got = mutableListOf<Reading>()
++        val rep = Vw(elm).scanAll(listOf(0x01), 1..3, {}, { got += it })
++        assertEquals(1, (rep["modules"] as List<*>).size)
++        assertTrue(got.any { it.channel.startsWith("VW.01.G002") })      // answer after "response pending"
++        assertTrue(link.log.any { it.startsWith("ATIIA01") })
++        assertEquals(93.0, Obd(elm).readPid(0x05).value)                  // OBD works again afterwards
++        assertTrue(link.log.any { it.startsWith("ATSHC133F1") })
++    }
++}

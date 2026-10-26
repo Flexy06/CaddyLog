@@ -63,6 +63,8 @@ val SIGNAL_COLORS: Map<Signal, Color> = mapOf(
     Signal.THROTTLE to Color(0xFFEC4899),
     Signal.ECU_VOLTAGE to Color(0xFF64748B),
     Signal.BATTERY to Color(0xFF94A3B8),
+    Signal.OIL_TEMP to Color(0xFFA16207),
+    Signal.EXHAUST_TEMP to Color(0xFFDC2626),
 )
 
 fun formatSignal(sig: Signal, v: Double): String = when (sig) {

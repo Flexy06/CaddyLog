@@ -236,6 +236,15 @@ object MonitorEngine {
         val sup = LoggerEngine.withElm { Obd(it).supported(0x01) } ?: emptyMap()
         supportedPids = sup.values.flatten().toSet()
         if (sup.isNotEmpty()) LoggerEngine.supported.value = sup
+        if (supportedPids.isNotEmpty()) {
+            LoggerEngine.note("Unterstützte Mode-01-PIDs: " + supportedPids.filter { !ObdPids.isBitmapPid(it) }.sorted()
+                .joinToString(" ") { "%02X".format(it) } + " – alle werden aufgezeichnet")
+        }
+        // values that never change while driving: read once per connection, not in every polling round
+        for (pid in supportedPids.filter { it in ObdPids.STATIC_PIDS }.sorted()) {
+            val r = LoggerEngine.withElm { Obd(it).readPid(pid) } ?: break
+            if (r.status == ReadStatus.OK) LoggerEngine.logReadings(r.readings)
+        }
         ui.update { st ->
             st.copy(signals = st.signals.mapValues { (sig, ss) ->
                 if (sig.pid == null || supportedPids.isEmpty()) ss else ss.copy(supported = sig.pid in supportedPids || sig == Signal.COOLANT)
@@ -245,8 +254,10 @@ object MonitorEngine {
 
     private fun samplerConfig(): LiveSampler.Config {
         val sup = supportedPids
-        val priority = LiveSampler.DEFAULT_PRIORITY.filter { sup.isEmpty() || it in sup }
-        val other = sup.filter { it != 0x05 && it !in priority && !ObdPids.isBitmapPid(it) }.sorted()
+        val priority = LiveSampler.DEFAULT_PRIORITY.filter { sup.isEmpty() || it in sup } +
+            LiveSampler.OPTIONAL_PRIORITY.filter { it in sup }
+        // everything else the ECU supports is polled round-robin – so every available sensor ends up in live.csv
+        val other = sup.filter { it != 0x05 && it !in priority && !ObdPids.isBitmapPid(it) && it !in ObdPids.STATIC_PIDS }.sorted()
         return LiveSampler.Config(targetHz = Settings.current.sampleHz, priorityPids = priority, otherPids = other)
     }
 

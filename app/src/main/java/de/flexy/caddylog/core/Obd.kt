@@ -14,10 +14,11 @@ class Obd(private val elm: Elm327) {
         val useCount = expectOne && elm.bus == Bus.KLINE && elm.responseCountSupported != false
         val r = try {
             elm.ensureObd()
-            val first = elm.cmd(bytes.toHex("") + if (useCount) "1" else "", timeoutMs)
+            val t = elm.timeoutFor(timeoutMs)
+            val first = elm.cmd(bytes.toHex("") + if (useCount) "1" else "", t)
             if (useCount && first.lines().any { it.trim() == "?" }) {
                 elm.responseCountSupported = false   // old/clone adapter: fall back to normal requests
-                elm.cmd(bytes.toHex(""), timeoutMs)
+                elm.cmd(bytes.toHex(""), elm.timeoutFor(timeoutMs))
             } else {
                 if (useCount && !Elm327.isError(first)) elm.responseCountSupported = true
                 first
@@ -52,6 +53,8 @@ class Obd(private val elm: Elm327) {
             r.isBlank() -> ReadStatus.NO_DATA
             else -> ReadStatus.INVALID
         }
+        // bus answered (or at least initialised) → normal timeouts again
+        if (status == ReadStatus.OK || status == ReadStatus.NO_DATA || status == ReadStatus.INVALID) elm.busInitPending = false
         return Response(status, payloads, r, busInit)
     }
 

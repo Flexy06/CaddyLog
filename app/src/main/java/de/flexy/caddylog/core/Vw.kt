@@ -6,13 +6,18 @@ package de.flexy.caddylog.core
  *
  * Only READ services are ever sent (session start, identification, read DTCs, read measuring blocks).
  */
-class Tp20(private val elm: Elm327, val module: Int, private val log: (String) -> Unit = {}) {
+class Tp20(private val elm: Elm327, override val module: Int, private val log: (String) -> Unit = {}) : KwpChannel {
     var txId = -1; private set
     var rxId = -1; private set
-    var isOpen = false; private set
+    override var isOpen = false; private set
     private var txSeq = 0
 
-    suspend fun open(): Boolean {
+    override suspend fun kwp(vararg req: Int): IntArray? = request(*req)
+
+    override fun describe(): Map<String, Any?> =
+        mapOf("transport" to "CAN TP2.0", "tp20_tx" to "%03X".format(txId), "tp20_rx" to "%03X".format(rxId))
+
+    override suspend fun open(): Boolean {
         isOpen = false
         elm.ensureRawCan()
         elm.target(0x200, 0x200 + module)
@@ -98,7 +103,7 @@ class Tp20(private val elm: Elm327, val module: Int, private val log: (String) -
         return Elm327.parseFrames(r).any { it.id == rxId && it.data.isNotEmpty() && it.data[0] == 0xA1 }
     }
 
-    suspend fun close() {
+    override suspend fun close() {
         if (!isOpen) return
         runCatching { elm.ensureRawCan(); elm.target(txId, rxId); elm.cmd("A8", 800) }
         isOpen = false
@@ -133,26 +138,28 @@ class Vw(private val elm: Elm327, private val log: (String) -> Unit = {}) {
         }
     }
 
+    /** CAN → TP2.0, K-Line → physical KWP2000 session */
+    private fun channel(module: Int): KwpChannel =
+        if (elm.bus == Bus.KLINE) KwpKLine(elm, module, log) else Tp20(elm, module, log)
+
     /** Scans one module. groups = measuring block numbers to read (KWP 21 xx). */
     suspend fun scanModule(module: Int, groups: IntRange, progress: (String) -> Unit, onReading: (Reading) -> Unit): Map<String, Any?>? {
-        val ch = Tp20(elm, module, log)
+        val ch = channel(module)
         if (!ch.open()) return null
-        val rep = linkedMapOf<String, Any?>(
-            "address" to "%02X".format(module), "name" to name(module),
-            "tp20_tx" to "%03X".format(ch.txId), "tp20_rx" to "%03X".format(ch.rxId)
-        )
+        val rep = linkedMapOf<String, Any?>("address" to "%02X".format(module), "name" to name(module))
+        rep.putAll(ch.describe())
         try {
             progress("SG %02X %s: Identifikation".format(module, name(module)))
             val ident = linkedMapOf<String, Any?>()
             for (opt in listOf(0x9B, 0x9A, 0x91, 0x86, 0x8A)) {
-                val r = ch.request(0x1A, opt) ?: continue
+                val r = ch.kwp(0x1A, opt) ?: continue
                 ident["1A%02X".format(opt)] = mapOf("raw" to r.toHex(""), "ascii" to r.copyOfRange(minOf(2, r.size), r.size).toAscii(), "positive" to (r[0] == 0x5A))
                 if (opt == 0x9B && r[0] == 0x5A) onReading(Reading("VW.%02X.IDENT".format(module), "SG %02X Identifikation".format(module), null, "", r.copyOfRange(2, r.size).toAscii(), r.toHex("")))
             }
             rep["identification"] = ident
 
             progress("SG %02X: Fehlerspeicher".format(module))
-            val d = ch.request(0x18, 0x02, 0xFF, 0x00)
+            val d = ch.kwp(0x18, 0x02, 0xFF, 0x00)
             rep["dtc_raw"] = d?.toHex("")
             if (d != null && d.size >= 2 && d[0] == 0x58) {
                 rep["dtcs"] = d.copyOfRange(2, d.size).toList().chunked(3).filter { it.size == 3 }.map { dtc(it[0], it[1], it[2]) }
@@ -162,7 +169,7 @@ class Vw(private val elm: Elm327, private val log: (String) -> Unit = {}) {
             var consecutiveFails = 0
             for (g in groups) {
                 progress("SG %02X: Messwertblock %03d".format(module, g))
-                val r = ch.request(0x21, g)
+                val r = ch.kwp(0x21, g)
                 if (r == null) {
                     consecutiveFails++
                     // channel lost? reopen once

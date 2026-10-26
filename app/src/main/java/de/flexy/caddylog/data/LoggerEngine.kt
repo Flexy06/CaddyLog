@@ -194,7 +194,7 @@ object LoggerEngine {
         e.protocolNumber?.let { p -> if (p != Settings.current.preferredProtocol) Settings.update { it.copy(preferredProtocol = p) } }
         val full = linkedMapOf("Gerät" to "${device.name} (${device.address})", "BLE" to l.description) + info
         session?.writeJson("meta.json", mapOf(
-            "app" to "CaddyLog 0.2", "fahrzeug" to "VW Caddy Maxi 2.0 EcoFuel (CNG), 2010",
+            "app" to "CaddyLog 0.3", "fahrzeug" to Settings.current.vehicleName,
             "android" to "${Build.MANUFACTURER} ${Build.MODEL} / SDK ${Build.VERSION.SDK_INT}",
             "adapter" to full, "start" to java.time.Instant.now().toString()
         ))
@@ -361,12 +361,16 @@ object LoggerEngine {
     }
 
     fun runVwScan(allAddresses: Boolean, groups: IntRange) {
-        if (elm?.bus == Bus.KLINE) {
-            addProgress("VW-TP2.0-Scan übersprungen: Das Fahrzeug kommuniziert über K-Line (ISO 14230-4). TP2.0 ist nur über CAN möglich.")
-            return
-        }
-        launchTask("VW-Steuergeräte-Scan") { e ->
-            val modules = if (allAddresses) (0x01..0x7F).toList() else Vw.MODULE_NAMES.keys.sorted()
+        val kLine = elm?.bus == Bus.KLINE
+        launchTask(if (kLine) "VW-Messwertblöcke (K-Line)" else "VW-Steuergeräte-Scan") { e ->
+            val modules = when {
+                // K-Line: every address costs a full bus init (~3–5 s) → engine first, the usual K-Line modules on request
+                kLine && allAddresses -> listOf(0x01, 0x02, 0x03, 0x08, 0x15, 0x17, 0x25)
+                kLine -> listOf(0x01)
+                allAddresses -> (0x01..0x7F).toList()
+                else -> Vw.MODULE_NAMES.keys.sorted()
+            }
+            if (kLine) addProgress("K-Line: Lese Messwertblöcke über eine KWP2000-Sitzung direkt mit dem Steuergerät. Live-Werte pausieren währenddessen.")
             val report = Vw(e, ::addProgress).scanAll(modules, groups, ::addProgress, ::onReading)
             session?.writeJson("scan_vw_${stamp()}.json", report)
             @Suppress("UNCHECKED_CAST")

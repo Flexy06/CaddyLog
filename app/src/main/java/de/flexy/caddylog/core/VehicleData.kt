@@ -35,7 +35,10 @@ enum class Signal(val pid: Int?, val label: String, val unit: String, val csv: S
     MAP(0x0B, "Saugrohrdruck", "kPa", "map_kpa", 20.0, 110.0),
     THROTTLE(0x11, "Drosselklappe", "%", "throttle_pct", 0.0, 100.0),
     ECU_VOLTAGE(0x42, "Steuergerätespannung", "V", "ecu_v", 10.0, 15.5),
-    BATTERY(null, "Bordnetz (Adapter)", "V", "battery_v", 10.0, 15.5);
+    BATTERY(null, "Bordnetz (Adapter)", "V", "battery_v", 10.0, 15.5),
+    // appended at the end so existing trip_series.csv columns keep their position
+    OIL_TEMP(0x5C, "Öltemperatur", "°C", "oil_c", 40.0, 140.0),
+    EXHAUST_TEMP(0x78, "Abgastemperatur", "°C", "egt_c", 0.0, 800.0);
 
     companion object {
         fun forPid(pid: Int) = entries.firstOrNull { it.pid == pid }

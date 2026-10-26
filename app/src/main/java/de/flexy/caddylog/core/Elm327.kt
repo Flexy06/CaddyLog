@@ -51,7 +51,7 @@ fun IntArray.toAscii() = map { if (it in 0x20..0x7E) it.toChar() else '.' }.join
  */
 class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _, _ -> }) {
 
-    enum class Mode { UNKNOWN, OBD, RAW_CAN }
+    enum class Mode { UNKNOWN, OBD, RAW_CAN, KWP_PHYSICAL }
 
     var mode = Mode.UNKNOWN
         private set
@@ -72,6 +72,19 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
      * waiting for the timeout). Speeds up K-Line polling a lot. null = not tried yet, false = adapter rejected it.
      */
     var responseCountSupported: Boolean? = null
+
+    /**
+     * K-Line: the session was closed (ATPC / address change), the next request triggers a new 5-baud or fast init.
+     * That takes ~2–5 s – longer than a normal request timeout – so the next request must wait longer.
+     */
+    var busInitPending = false
+
+    /** K-Line: ECU address of a physical KWP2000 session (VW measuring blocks), null = normal OBD (functional 0x33) */
+    var kwpTarget: Int? = null
+        private set
+
+    /** timeout for the next request: long if a K-Line (re)initialisation is due */
+    fun timeoutFor(normalMs: Long): Long = if (busInitPending && bus != Bus.CAN) maxOf(normalMs, 9_000) else normalMs
 
     private var lastHeader = -1
     private var lastReceiveFilter = -1
@@ -125,6 +138,7 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
         info["Bus"] = bus.label
         info["Antwort 0100"] = r
         mode = Mode.OBD
+        kwpTarget = null; busInitPending = false
         lastHeader = 0x7DF; lastReceiveFilter = -1
         return info
     }
@@ -134,6 +148,7 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
         if (mode == Mode.OBD) return
         if (bus == Bus.KLINE) {
             // K-Line: keep the adapter's default KWP header (ATSH with an 11-bit CAN id would break it)
+            if (kwpTarget != null) restoreKLineDefaults()
             cmd("ATH1"); cmd("ATS1"); cmd("ATAT1")
         } else {
             cmd("ATH1"); cmd("ATS1"); cmd("ATCAF1"); cmd("ATAR"); cmd("ATSH7DF"); cmd("ATAT1"); cmd("ATST32")
@@ -146,6 +161,40 @@ class Elm327(private val link: ElmLink, private val rawLog: RawLog = RawLog { _,
     suspend fun reinitBus() {
         cmd("ATPC")
         mode = Mode.UNKNOWN
+        busInitPending = true
+    }
+
+    private val isoSlowInit get() = protocolNumber == "3" || protocolNumber == "4"
+
+    /**
+     * K-Line: physical KWP2000 session to one ECU (VW address, e.g. 0x01 engine) for VW measuring blocks.
+     * Closes the OBD session; the next request initialises the bus with the ECU's address.
+     * ensureObd() switches back to the standard OBD addressing.
+     */
+    suspend fun ensureKwpPhysical(module: Int) {
+        check(bus == Bus.KLINE) { "Physische KWP-Adressierung nur über K-Line" }
+        if (mode == Mode.KWP_PHYSICAL && kwpTarget == module) return
+        cmd("ATPC")
+        if (isoSlowInit) cmd("ATIIA%02X".format(module))      // 5-baud init address
+        cmd("ATSH81%02XF1".format(module))                      // format 81 (physical), target, tester F1
+        cmd("ATWM81%02XF13E".format(module))                    // keep-alive = TesterPresent to this ECU
+        cmd("ATH1"); cmd("ATS1"); cmd("ATAT1")
+        kwpTarget = module
+        mode = Mode.KWP_PHYSICAL
+        busInitPending = true
+    }
+
+    /** back to the adapter defaults for OBD on K-Line (functional address 0x33) */
+    private suspend fun restoreKLineDefaults() {
+        cmd("ATPC")
+        if (protocolNumber == "3") {
+            cmd("ATSH686AF1"); cmd("ATWM686AF10100")
+        } else {
+            cmd("ATSHC133F1"); cmd("ATWMC133F13E")
+        }
+        if (isoSlowInit) cmd("ATIIA33")
+        kwpTarget = null
+        busInitPending = true
     }
 
     /** Raw CAN mode: no auto formatting (PCI bytes are ours), fixed short timeout. Used for VW TP2.0. */
