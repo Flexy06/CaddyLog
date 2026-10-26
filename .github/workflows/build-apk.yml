@@ -8,7 +8,7 @@ on:
   workflow_dispatch:   # manuell starten über den Tab "Actions"
 
 permissions:
-  contents: write      # nötig, um bei Tags ein Release anzulegen
+  contents: write      # nötig, um Releases anzulegen
 
 jobs:
   build:
@@ -35,17 +35,38 @@ jobs:
       - name: Debug-APK bauen
         run: ./gradlew assembleDebug
 
+      - name: Versionsname und APK-Dateiname bestimmen
+        id: ver
+        run: |
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            NAME="CaddyLog ${GITHUB_REF_NAME}"
+          else
+            TAG="v${VERSION}-build${GITHUB_RUN_NUMBER}"
+            NAME="CaddyLog ${VERSION} (Build ${GITHUB_RUN_NUMBER})"
+          fi
+          APK="CaddyLog-${TAG}.apk"
+          cp app/build/outputs/apk/debug/*.apk "$APK"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
       - name: APK als Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
-          name: CaddyLog-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
+          name: CaddyLog-${{ steps.ver.outputs.tag }}
+          path: ${{ steps.ver.outputs.apk }}
 
-      - name: Release "latest" aktualisieren
-        if: github.ref == 'refs/heads/main'
+      # Jeder Push auf main (und jeder v*-Tag) wird ein eigenes Release und als „Latest“ markiert.
+      - name: Release anlegen
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Neuester Build
-          prerelease: true
-          files: app/build/outputs/apk/debug/*.apk
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.ver.outputs.name }}
+          generate_release_notes: true
+          prerelease: false
+          make_latest: true
+          files: ${{ steps.ver.outputs.apk }}
